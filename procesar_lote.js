@@ -34,6 +34,31 @@ async function registrarAlertaEnObservaciones(expediente, mensajeError) {
   }
 }
 
+// Filtro para omitir carátulas de firmas GDE o copias redundantes
+function esHojaDescartable(textoPagina, esFactura = false) {
+  const tNorm = normalizarTexto(textoPagina || '');
+
+  // 1. Descartar Hoja Adicional de Firmas / GEDO (GDE)
+  if (
+    tNorm.includes('HOJA ADICIONAL DE FIRMAS') ||
+    tNorm.includes('EL DOCUMENTO FUE IMPORTADO POR EL SISTEMA GEDO')
+  ) {
+    return { descartar: true, motivo: 'Hoja Adicional de Firmas / GEDO' };
+  }
+
+  // 2. Descartar Duplicados o Triplicados en Facturas AFIP
+  if (esFactura) {
+    const esCopia = tNorm.includes('DUPLICADO') || tNorm.includes('TRIPLICADO');
+    const esOriginal = tNorm.includes('ORIGINAL');
+
+    if (esCopia && !esOriginal) {
+      return { descartar: true, motivo: 'Copia no original (Duplicado/Triplicado)' };
+    }
+  }
+
+  return { descartar: false };
+}
+
 function coincidenNombres(nombreExcel, textoDocumentos) {
   if (!nombreExcel || !textoDocumentos) return false;
 
@@ -108,6 +133,19 @@ async function ejecutarOcrPagina(rutaPdf, numeroPagina) {
   }
 }
 
+async function extraerTextoPaginaIndividual(rutaPdf, numeroPagina) {
+  try {
+    const { stdout } = await execFileAsync('pdftotext', [
+      '-layout', '-enc', 'UTF-8',
+      '-f', String(numeroPagina), '-l', String(numeroPagina),
+      rutaPdf, '-'
+    ]);
+    return stdout || '';
+  } catch (_) {
+    return '';
+  }
+}
+
 async function extraerTextoCompleto(rutaArchivo) {
   let textoFinal = '';
   let totalPaginas = 1;
@@ -119,11 +157,7 @@ async function extraerTextoCompleto(rutaArchivo) {
   } catch (_) {}
 
   for (let p = 1; p <= totalPaginas; p++) {
-    let textoPag = '';
-    try {
-      const { stdout } = await execFileAsync('pdftotext', ['-layout', '-enc', 'UTF-8', '-f', String(p), '-l', String(p), rutaArchivo, '-']);
-      textoPag = stdout || '';
-    } catch (_) {}
+    let textoPag = await extraerTextoPaginaIndividual(rutaArchivo, p);
 
     if (textoPag.replace(/\s+/g, '').length < 35) {
       const ocrTexto = await ejecutarOcrPagina(rutaArchivo, p);
@@ -157,7 +191,6 @@ function extraerDatos(texto, nombreArchivo) {
   const datos = { op: null, monto: null, factura: null, titular: null, cuit: null };
   const lineas = texto.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
 
-  // Sanitizar sellos y metadatos GDE
   const textoSinGde = texto
     .replace(/DOCFI-20\d{2}-\d{5,10}[^\s]*/gi, ' ')
     .replace(/EX-20\d{2}-\d{5,10}[^\s]*/gi, ' ');
@@ -183,7 +216,6 @@ function extraerDatos(texto, nombreArchivo) {
   }
 
   // 4. FACTURA
-  // A) AFIP / ARCA estándar
   const matchPuntoVenta = tPlano.match(/Punto\s*de\s*Venta:?\s*(\d{1,5})/i) ||
                           textoSinGde.match(/Punto\s*de\s*Venta:?\s*(\d{1,5})/i);
   const matchCompNro = tPlano.match(/Comp\.?\s*Nro:?\s*(\d{1,8})/i) ||
@@ -194,7 +226,6 @@ function extraerDatos(texto, nombreArchivo) {
     datos.factura = normalizarFactura(matchPuntoVenta[1], matchCompNro[1]);
   }
 
-  // B) En una sola línea
   if (!datos.factura) {
     const matchAfipDirecto = tPlano.match(/Punto\s*de\s*Venta:?\s*(\d{1,5})[^\d]{1,25}Comp\.?\s*Nro:?\s*(\d{1,8})/i);
     if (matchAfipDirecto) {
@@ -202,7 +233,6 @@ function extraerDatos(texto, nombreArchivo) {
     }
   }
 
-  // C) Rentas Santiago del Estero (IIBB)
   if (!datos.factura) {
     const matchRentas = tPlano.match(/FACTURA\s+[A-C]?\s+(\d{1,5})\s+(\d{5,8})/i) ||
                         textoSinGde.match(/FACTURA\s+[A-C]?[\s\S]{1,60}?(\d{3,5})\s+(\d{6,8})/i);
@@ -211,7 +241,6 @@ function extraerDatos(texto, nombreArchivo) {
     }
   }
 
-  // D) SICORE / Retención AFIP[cite: 3]
   if (!datos.factura) {
     const matchSicore = tPlano.match(/(?:Tique|Factura)[^\d]{1,35}(\d{4,5})\s*-\s*(\d{6,8})/i);
     if (matchSicore) {
@@ -219,7 +248,6 @@ function extraerDatos(texto, nombreArchivo) {
     }
   }
 
-  // E) OPF[cite: 3]
   if (!datos.factura) {
     const matchOpf = textoSinGde.match(/FAC(?:TURA)?\s+[A-Z\u0400-\u04FF]?\s*(\d{3,5})\s*-\s*(\d{5,8})/i) ||
                      tPlano.match(/FAC(?:TURA)?\s+[A-Z\u0400-\u04FF]?\s*(\d{3,5})\s*-\s*(\d{5,8})/i);
@@ -228,13 +256,11 @@ function extraerDatos(texto, nombreArchivo) {
     }
   }
 
-  // F) Desde nombre del archivo[cite: 3]
   if (!datos.factura && (nombreArchivo.toLowerCase().includes('sicore') || nombreArchivo.toLowerCase().includes('fac') || nombreArchivo.toLowerCase().includes('iibb'))) {
     const mNom = nombreArchivo.match(/(\d{1,5})\s*-\s*(\d{1,8})/);
     if (mNom) datos.factura = normalizarFactura(mNom[1], mNom[2]);
   }
 
-  // Titular
   for (const l of lineas) {
     const matchTes = l.match(/Tesorer.*?a:\s*([A-Za-z\s]{4,40})/i);
     if (matchTes) { datos.titular = limpiarNombre(matchTes[1]); break; }
@@ -581,6 +607,14 @@ async function procesarSubcarpetaExpediente(carpetaExpediente, carpetaFecha, map
         const paginasFacturas = [];
 
         for (let p = 1; p <= totalPaginas; p++) {
+          const textoPagina = await extraerTextoPaginaIndividual(doc.rutaCompleta, p);
+          const filtroDescarte = esHojaDescartable(textoPagina, doc.tipoDetectado === 'FACTURA');
+
+          if (filtroDescarte.descartar) {
+            console.log(`  ✂️ [PÁGINA DESCARTADA] Pág. ${p} de ${doc.nombreArchivo} (${filtroDescarte.motivo})`);
+            continue;
+          }
+
           const tmpBase = path.join(RUTA_TEMP, `pag_comp_${Date.now()}_${p}`);
           const imgFinal = `${tmpBase}.png`;
 
@@ -621,7 +655,16 @@ async function procesarSubcarpetaExpediente(carpetaExpediente, carpetaFecha, map
         }
 
       } else {
+        // Documentos simples o fojas individuales
         for (let p = 1; p <= totalPaginas; p++) {
+          const textoPagina = await extraerTextoPaginaIndividual(doc.rutaCompleta, p);
+          const filtroDescarte = esHojaDescartable(textoPagina, doc.tipoDetectado === 'FACTURA');
+
+          if (filtroDescarte.descartar) {
+            console.log(`  ✂️ [PÁGINA DESCARTADA] Pág. ${p} de ${doc.nombreArchivo} (${filtroDescarte.motivo})`);
+            continue;
+          }
+
           const tmpBase = path.join(RUTA_TEMP, `pag_rot_${Date.now()}_${p}`);
           const imgFinal = `${tmpBase}.png`;
 
