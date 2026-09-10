@@ -6,3 +6,4 @@ datos.db
 datos.db-wal
 datos.db-shm
 .env
+*.xlsx
