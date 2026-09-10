@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+  <title>Control de Expedientes GDE</title>
+  <link rel="stylesheet" href="/estilos.css">
+</head>
+
+<body>
+
+  <!-- Banner flotante de reconexión SSE -->
+  <div id="bannerConexion" class="banner-reconexion" style="display: none;">
+    <span class="banner-reconexion-dot"></span>
+    <span id="bannerConexionTxt">Conexión perdida. Reconectando con el servidor...</span>
+  </div>
+
+  <div class="header">
+    <div class="header-info">
+      <h1>Panel de Control GDE</h1>
+      <span id="archivoCargadoTxt" style="color: var(--text-dim); font-size: 0.82rem;">Archivo: Ninguno</span>
+      <div id="buzonStatus" class="buzon-status-pill">
+        <span class="buzon-dot"></span>
+        <span id="buzonTxt">Buzón: Ningún expediente seleccionado</span>
+      </div>
+    </div>
+    <div class="header-actions">
+      <input type="file" id="inputExcel" accept=".xlsx" style="display: none;" onchange="subirExcel()">
+
+      <!-- Subir Excel -->
+      <button class="btn btn-upload" onclick="document.getElementById('inputExcel').click()" title="Subir Excel">
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242" />
+          <path d="M12 12v9" />
+          <path d="m16 16-4-4-4 4" />
+        </svg>
+        <span class="btn-txt">Subir Excel</span>
+      </button>
+
+      <!-- Procesar Documentos -->
+      <button id="btnProcesar" class="btn btn-primary" onclick="iniciarProceso()" title="Procesar Documentos">
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" />
+        </svg>
+        <span class="btn-txt">Procesar Documentos</span>
+      </button>
+
+      <!-- Terminal -->
+      <button id="btnVerTerminal" class="btn btn-terminal-toggle" onclick="abrirTerminalModal()"
+        title="Consola de Ejecución">
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="4 17 10 11 4 5" />
+          <line x1="12" y1="19" x2="20" y2="19" />
+        </svg>
+        <span class="btn-txt">Ver Terminal</span>
+      </button>
+
+      <!-- Resetear Todo -->
+      <button class="btn btn-reset" onclick="resetearTodo()" title="Resetear Todo">
+        <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 6h18" />
+          <path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6" />
+          <path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2" />
+          <line x1="10" y1="11" x2="10" y2="17" />
+          <line x1="14" y1="11" x2="14" y2="17" />
+        </svg>
+        <span class="btn-txt">Resetear Todo</span>
+      </button>
+    </div>
+  </div>
+
+  <div class="stats">
+    <div class="card">
+      <div class="card-label" style="color: var(--text-dim);">Total Válidos</div>
+      <div class="card-num" id="totalCount">0</div>
+    </div>
+    <div class="card">
+      <div class="card-label" style="color: var(--green);">Completados</div>
+      <div class="card-num" id="procesadosCount" style="color: var(--green);">0</div>
+    </div>
+    <div class="card">
+      <div class="card-label" style="color: var(--yellow);">Listos (Con PDFs)</div>
+      <div class="card-num" id="listosCount" style="color: var(--yellow);">0</div>
+    </div>
+    <div class="card">
+      <div class="card-label" style="color: var(--red);">Con Problema</div>
+      <div class="card-num" id="errorCount" style="color: var(--red);">0</div>
+    </div>
+    <div class="card">
+      <div class="card-label" style="color: var(--text-dim);">Pendientes</div>
+      <div class="card-num" id="pendientesCount">0</div>
+    </div>
+  </div>
+
+  <!-- Pestañas, Buscador y Selector de Tamaño de Página -->
+  <div class="table-toolbar">
+    <div class="tabs-group">
+      <button class="tab-btn active" data-tab="pendientes" onclick="cambiarTab('pendientes')">
+        Trabajo Activo <span class="tab-badge" id="badgeTabPendientes">0</span>
+      </button>
+      <button class="tab-btn" data-tab="errores" onclick="cambiarTab('errores')">
+        Con Problema <span class="tab-badge" id="badgeTabErrores"
+          style="background: rgba(239, 68, 68, 0.2); color: #ef4444;">0</span>
+      </button>
+      <button class="tab-btn" data-tab="completados" onclick="cambiarTab('completados')">
+        Completados <span class="tab-badge" id="badgeTabCompletados">0</span>
+      </button>
+      <button class="tab-btn" data-tab="todos" onclick="cambiarTab('todos')">
+        Todos <span class="tab-badge" id="badgeTabTodos">0</span>
+      </button>
+    </div>
+
+    <!-- Buscador de texto rápido -->
+    <div class="search-box-wrapper">
+      <svg class="search-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+        stroke-linecap="round" stroke-linejoin="round">
+        <circle cx="11" cy="11" r="8" />
+        <line x1="21" y1="21" x2="16.65" y2="16.65" />
+      </svg>
+      <input type="text" id="inputBuscador" placeholder="Buscar expediente, ID, nombre... (Presioná /)"
+        oninput="filtrarPorTexto(this.value)" onkeydown="manejarTeclasBuscador(event)">
+      <button id="btnLimpiarBusqueda" class="btn-clear-search" onclick="limpiarBuscador()"
+        title="Limpiar búsqueda (Esc)">✕</button>
+    </div>
+
+    <div class="page-size-selector">
+      <label for="selectPageSize">Filas por página:</label>
+      <select id="selectPageSize" onchange="cambiarFilasPorPagina(this.value)">
+        <option value="15">15</option>
+        <option value="25" selected>25</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="tabla-contenedor" id="contenedorTabla">
+    <table>
+      <thead>
+        <tr>
+          <th class="sortable" onclick="ordenarPor('fecha')" style="min-width: 95px;">
+            Fecha <span class="sort-icon" id="sort-fecha">↕</span>
+          </th>
+          <th class="sortable" onclick="ordenarPor('id')" style="min-width: 75px;">
+            ID <span class="sort-icon" id="sort-id">↕</span>
+          </th>
+          <th class="sortable" onclick="ordenarPor('nombre')" style="min-width: 180px;">
+            Beneficiario <span class="sort-icon" id="sort-nombre">↕</span>
+          </th>
+          <th class="sortable" onclick="ordenarPor('expediente')" style="min-width: 155px;">
+            Expediente (GDE) <span class="sort-icon" id="sort-expediente">↕</span>
+          </th>
+          <th class="sortable" onclick="ordenarPor('monto')" style="min-width: 110px;">
+            Monto <span class="sort-icon" id="sort-monto">↕</span>
+          </th>
+          <th style="min-width: 120px;">Estado</th>
+          <th style="min-width: 140px;">Acciones</th>
+          <th style="min-width: 60px; text-align: center;">¿Error?</th>
+          <th style="min-width: 180px;">Observaciones</th>
+        </tr>
+      </thead>
+      <tbody id="tablaBody"></tbody>
+    </table>
+  </div>
+
+  <!-- Paginador -->
+  <div class="pagination-footer">
+    <div class="pagination-info" id="paginationInfo">Mostrando 0 de 0</div>
+    <div class="pagination-controls">
+      <button class="btn-page" id="btnPrevPage" onclick="cambiarPagina(-1)">◀ Anterior</button>
+      <span class="pagination-current" id="paginationCurrent">Pág. 1 de 1</span>
+      <button class="btn-page" id="btnNextPage" onclick="cambiarPagina(1)">Siguiente ▶</button>
+    </div>
+  </div>
+
+  <!-- Terminal (Modal / Docked) -->
+  <div id="terminalOverlay" class="terminal-overlay" onclick="cerrarTerminalPorFondo(event)">
+    <div id="terminalWrapper" class="terminal-wrapper" onclick="event.stopPropagation()">
+      <div class="terminal-topbar">
+        <div class="terminal-titulo">
+          <span class="punto-consola"></span>
+          <span>Consola de Ejecución GDE</span>
+        </div>
+        <div class="terminal-controles">
+          <button id="btnTermCancelar" class="btn-term-ctrl btn-term-cancelar" onclick="cancelarProcesoDesdeTerminal()"
+            style="display: none;" title="Detener lote en curso">
+            ⏹ Cancelar Lote
+          </button>
+          <button id="btnDockTerminal" class="btn-term-ctrl" onclick="toggleDockTerminal()" title="Mover abajo / Al centro">
+            ⬇ Anclar Abajo
+          </button>
+          <button class="btn-term-ctrl btn-term-close" onclick="cerrarTerminal()" title="Ocultar consola">
+            ✕
+          </button>
+        </div>
+      </div>
+      <div class="console" id="terminalLogs">Esperando órdenes...</div>
+    </div>
+  </div>
+
+  <div id="popoverGde" class="gde-popover">
+    <div class="gde-popover-header">
+      <span>Copiar a GDE</span>
+      <span style="cursor:pointer;" onclick="cerrarPopover()">✕</span>
+    </div>
+    <button class="gde-btn-copy" id="btnGdeMee" onclick="copiarTextoGde(this)">
+      <span class="txt"></span>
+      <span class="sub">MEE#SEH (Economía)</span>
+    </button>
+    <button class="gde-btn-copy" id="btnGdeMeg" onclick="copiarTextoGde(this)">
+      <span class="txt"></span>
+      <span class="sub">MEG#INT (Intendencia)</span>
+    </button>
+  </div>
+
+  <div id="toastCopiado">✓ Copiado al portapapeles</div>
+
+  <!-- Script desacoplado -->
+  <script src="/app.js"></script>
+</body>
+
+</html>

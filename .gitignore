@@ -1,0 +1,7 @@
+temp/
+entreda/
+salida/
+node_modules/
+datos.db
+datos.db-wal
+datos.db-shm
