@@ -1,6 +1,6 @@
-temp/
-entrada/
-salida/
+temp/*
+entrada/*
+salida/*
 node_modules/
 datos.db
 datos.db-wal
