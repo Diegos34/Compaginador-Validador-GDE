@@ -32,10 +32,11 @@ function guardarObservacion(expediente, observacion, tieneErrorManual) {
   stmtGuardarObs.run(expediente, observacion || '', tieneErrorManual ? 1 : 0);
 }
 
-// Obtener todos los expedientes ordenados por fecha e ID
+// Obtener todos los expedientes ordenados exactamente como en la tabla web
 const stmtObtenerTodos = db.prepare(`
   SELECT expediente, id, nombre, fecha, monto, observacion, tiene_error_manual
   FROM expedientes
+  ORDER BY fecha ASC, id ASC
 `);
 
 function obtenerTodosLosExpedientes() {

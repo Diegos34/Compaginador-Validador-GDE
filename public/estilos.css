@@ -121,45 +121,71 @@ body {
   filter: grayscale(1);
 }
 
+/* Subir Excel (Verde esmeralda translúcido) */
 .btn-upload {
-  background: #065f46;
-  color: #a7f3d0;
-  border-color: rgba(52, 211, 153, 0.2);
+  background: rgba(6, 95, 70, 0.25);
+  color: #6ee7b7;
+  border: 1px solid rgba(52, 211, 153, 0.35);
 }
 .btn-upload:hover:not(:disabled) {
-  background: #047857;
-  color: #fff;
+  background: rgba(16, 185, 129, 0.2);
+  border-color: #10b981;
+  color: #a7f3d0;
+  box-shadow: 0 0 12px rgba(16, 185, 129, 0.25);
 }
 
+/* Descargar de GDE Bot (Cian / Celeste translúcido) */
+.btn-bot {
+  background: rgba(14, 116, 144, 0.25);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.btn-bot:hover:not(:disabled) {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: #38bdf8;
+  color: #e0f2fe;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.3);
+}
+
+/* Procesar Documentos (Azul zafiro translúcido) */
 .btn-primary {
-  background: #2563eb;
-  color: #ffffff;
-  border-color: rgba(96, 165, 250, 0.3);
-  box-shadow: 0 0 15px rgba(37, 99, 235, 0.25);
-}
-.btn-primary:hover:not(:disabled) {
-  background: #1d4ed8;
-  box-shadow: 0 0 20px rgba(37, 99, 235, 0.4);
+  background: rgba(37, 99, 235, 0.25);
+  color: #93c5fd;
+  border: 1px solid rgba(96, 165, 250, 0.35);
 }
 
+.btn-primary:hover:not(:disabled) {
+  background: rgba(37, 99, 235, 0.4);
+  border-color: #60a5fa;
+  color: #ffffff;
+  box-shadow: 0 0 14px rgba(37, 99, 235, 0.35);
+}
+
+/* Ver Terminal (Gris pizarra / Consola) */
 .btn-terminal-toggle {
-  background: #0f172a;
-  color: var(--accent);
+  background: rgba(15, 23, 42, 0.6);
+  color: #38bdf8;
   border: 1px solid rgba(56, 189, 248, 0.3);
 }
+
 .btn-terminal-toggle:hover:not(:disabled) {
-  background: rgba(56, 189, 248, 0.1);
-  border-color: var(--accent);
+  background: rgba(56, 189, 248, 0.12);
+  border-color: #38bdf8;
+  box-shadow: 0 0 12px rgba(56, 189, 248, 0.25);
 }
 
+/* Resetear Todo (Carmesí / Alerta translúcido) */
 .btn-reset {
-  background: rgba(244, 63, 94, 0.1);
+  background: rgba(244, 63, 94, 0.12);
   color: #fda4af;
-  border-color: rgba(244, 63, 94, 0.25);
+  border: 1px solid rgba(244, 63, 94, 0.3);
 }
 .btn-reset:hover:not(:disabled) {
-  background: #e11d48;
-  color: #fff;
+  background: rgba(225, 29, 72, 0.25);
+  border-color: #f43f5e;
+  color: #ffffff;
+  box-shadow: 0 0 12px rgba(244, 63, 94, 0.3);
 }
 
 .btn-icon {

@@ -1,938 +1,468 @@
-let procesoActivo = false;
-let modoTerminal = 'cerrada';
-let ultimoJsonExpedientes = '';
-let textoBusqueda = '';
-let timerReintentoSSE = null;
-
-let tabActual = 'pendientes';
+let expedientesGlobales = [];
+let expedientesFiltrados = [];
+let filtroTabActual = 'pendientes';
 let paginaActual = 1;
 let filasPorPagina = 25;
-let todosLosItems = [];
-let expedienteEnEscucha = null;
+let columnaOrden = 'id';
+let ordenAsc = true;
+let botEnEjecucion = false;
 
-let columnaOrden = null;
-let ordenAscendente = true;
+// Formateador de fecha a DD-MM-YYYY
+function formatearFecha(valor) {
+  if (!valor) return '-';
+  const d = new Date(valor);
+  if (!isNaN(d.getTime())) {
+    const dia = String(d.getDate()).padStart(2, '0');
+    const mes = String(d.getMonth() + 1).padStart(2, '0');
+    const anio = d.getFullYear();
+    return `${dia}-${mes}-${anio}`;
+  }
+  return valor;
+}
 
-// Parser universal a entero matemático YYYYMMDD
-function fechaANumeroComparable(fStr) {
-  if (!fStr) return 0;
-  const limpia = String(fStr).replace(/[\r\n\t]/g, ' ').trim();
-  const match = limpia.match(/(\d{1,4})[-/](\d{1,2})[-/](\d{1,4})/);
-  if (!match) return 0;
+// Iniciar conexión de Server-Sent Events (SSE)
+function inicializarEventosSSE() {
+  const banner = document.getElementById('bannerConexion');
+  const evtSource = new EventSource('/api/eventos');
 
-  let d, m, y;
-  if (match[1].length === 4) {
-    y = parseInt(match[1], 10);
-    m = parseInt(match[2], 10);
-    d = parseInt(match[3], 10);
-  } else {
-    d = parseInt(match[1], 10);
-    m = parseInt(match[2], 10);
-    y = parseInt(match[3], 10);
-    if (y < 100) y = 2000 + y;
+  evtSource.onopen = () => {
+    if (banner) banner.style.display = 'none';
+  };
+
+  evtSource.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data);
+      if (data.tipo === 'log') {
+        agregarLogTerminal(data.texto);
+      } else if (data.tipo === 'actualizar') {
+        cargarExpedientes();
+      } else if (data.tipo === 'bot_terminado') {
+        setBotEstado(false);
+      }
+    } catch (_) {}
+  };
+
+  evtSource.onerror = () => {
+    if (banner) banner.style.display = 'inline-flex';
+  };
+}
+
+function agregarLogTerminal(texto) {
+  const terminal = document.getElementById('terminalLogs');
+  if (!terminal) return;
+
+  if (terminal.textContent === 'Esperando órdenes...') {
+    terminal.textContent = '';
   }
 
-  if (isNaN(y) || isNaN(m) || isNaN(d)) return 0;
-  return (y * 10000) + (m * 100) + d;
-}
+  const linea = document.createElement('div');
+  linea.className = 'linea-log';
 
-function ordenarPor(columna) {
-  if (columnaOrden === columna) {
-    ordenAscendente = !ordenAscendente;
-  } else {
-    columnaOrden = columna;
-    ordenAscendente = true;
+  if (texto.includes('❌') || texto.includes('Error') || texto.includes('🛑')) {
+    linea.className += ' log-error';
+  } else if (texto.includes('✔') || texto.includes('✅') || texto.includes('🎉')) {
+    linea.className += ' log-success';
+  } else if (texto.includes('⚠️') || texto.includes('•') || texto.includes('⏹')) {
+    linea.className += ' log-warn';
   }
-  paginaActual = 1;
-  actualizarIndicadoresOrden();
-  renderTabla(todosLosItems);
-}
 
-function actualizarIndicadoresOrden() {
-  ['fecha', 'id', 'nombre', 'expediente', 'monto'].forEach(col => {
-    const span = document.getElementById(`sort-${col}`);
-    const th = span?.parentElement;
-    if (!span || !th) return;
-
-    if (columnaOrden === col) {
-      th.classList.add('sort-active');
-      span.textContent = ordenAscendente ? '▲' : '▼';
-    } else {
-      th.classList.remove('sort-active');
-      span.textContent = '↕';
-    }
-  });
-}
-
-function cambiarTab(nuevoTab) {
-  tabActual = nuevoTab;
-  paginaActual = 1;
-  document.querySelectorAll('.tab-btn').forEach(btn => {
-    btn.classList.toggle('active', btn.dataset.tab === nuevoTab);
-  });
-  renderTabla(todosLosItems);
-}
-
-function cambiarFilasPorPagina(val) {
-  filasPorPagina = parseInt(val, 10);
-  paginaActual = 1;
-  renderTabla(todosLosItems);
-}
-
-function cambiarPagina(delta) {
-  paginaActual += delta;
-  renderTabla(todosLosItems);
+  linea.textContent = texto;
+  terminal.appendChild(linea);
+  terminal.scrollTop = terminal.scrollHeight;
 }
 
 function abrirTerminalModal() {
   const overlay = document.getElementById('terminalOverlay');
   const wrapper = document.getElementById('terminalWrapper');
-  const btnDock = document.getElementById('btnDockTerminal');
+  if (!overlay || !wrapper) return;
 
-  if (wrapper.parentElement !== overlay) overlay.appendChild(wrapper);
+  overlay.classList.add('activo', 'modo-modal');
+  wrapper.classList.remove('modo-docked');
+  wrapper.classList.add('modo-modal');
   document.body.classList.remove('terminal-docked');
-
-  overlay.className = 'terminal-overlay activo modo-modal';
-  wrapper.className = 'terminal-wrapper modo-modal';
-  btnDock.textContent = '⬇ Anclar Abajo';
-  modoTerminal = 'modal';
-
-  hacerScrollAlFondoTerminal();
-}
-
-function toggleDockTerminal() {
-  const overlay = document.getElementById('terminalOverlay');
-  const wrapper = document.getElementById('terminalWrapper');
-  const tablaContenedor = document.getElementById('contenedorTabla');
-  const btnDock = document.getElementById('btnDockTerminal');
-
-  if (modoTerminal === 'modal') {
-    overlay.className = 'terminal-overlay';
-    tablaContenedor.insertAdjacentElement('afterend', wrapper);
-    wrapper.className = 'terminal-wrapper modo-docked';
-    document.body.classList.add('terminal-docked');
-
-    btnDock.textContent = '⛶ Al Centro';
-    modoTerminal = 'docked';
-    setTimeout(() => { wrapper.scrollIntoView({ behavior: 'smooth', block: 'start' }); }, 60);
-  } else {
-    abrirTerminalModal();
-  }
-  hacerScrollAlFondoTerminal();
 }
 
 function cerrarTerminal() {
   const overlay = document.getElementById('terminalOverlay');
   const wrapper = document.getElementById('terminalWrapper');
-  if (wrapper.parentElement !== overlay) overlay.appendChild(wrapper);
+  if (overlay) overlay.classList.remove('activo', 'modo-modal');
+  if (wrapper) wrapper.classList.remove('modo-modal', 'modo-docked');
   document.body.classList.remove('terminal-docked');
-  overlay.className = 'terminal-overlay';
-  wrapper.className = 'terminal-wrapper';
-  modoTerminal = 'cerrada';
 }
 
-function cerrarTerminalPorFondo(e) {
-  if (modoTerminal === 'modal' && e.target.id === 'terminalOverlay') cerrarTerminal();
-}
-
-function hacerScrollAlFondoTerminal() {
-  const term = document.getElementById('terminalLogs');
-  setTimeout(() => { term.scrollTop = term.scrollHeight; }, 50);
-}
-
-function formatearLogsConColores(rawLogs) {
-  if (!rawLogs) return '';
-  return rawLogs
-    .split('\n')
-    .map(linea => {
-      const segura = linea
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;');
-
-      if (/\[ERROR|ALERTA|DISCREPANCIA|CANCELADO|FALLO\]/i.test(segura)) {
-        return `<span class="log-error">${segura}</span>`;
-      }
-      if (/\[OK|ÉXITO|EXITOSAMENTE|COMPLETADO|BUZÓN AUTO\]/i.test(segura)) {
-        return `<span class="log-success">${segura}</span>`;
-      }
-      if (/\[ATENCIÓN|REVISIÓN|ADVERTENCIA|SALTADO\]/i.test(segura)) {
-        return `<span class="log-warn">${segura}</span>`;
-      }
-      if (/^(===|---|=== EXPEDIENTE|EXPEDIENTE:)/.test(segura.trim())) {
-        return `<span class="log-header">${segura}</span>`;
-      }
-      return segura;
-    })
-    .join('\n');
-}
-
-function actualizarUIProceso(enProc) {
-  procesoActivo = enProc;
-  const btn = document.getElementById('btnProcesar');
-  const btnTermCancelar = document.getElementById('btnTermCancelar');
-
-  // Mostrar u ocultar el botón de cancelación en la terminal según corresponda
-  if (btnTermCancelar) {
-    btnTermCancelar.style.display = enProc ? 'inline-flex' : 'none';
+function cerrarTerminalPorFondo(event) {
+  if (event.target.id === 'terminalOverlay') {
+    cerrarTerminal();
   }
+}
 
-  if (!btn) return;
+function toggleDockTerminal() {
+  const overlay = document.getElementById('terminalOverlay');
+  const wrapper = document.getElementById('terminalWrapper');
+  const btnDock = document.getElementById('btnDockTerminal');
 
-  const txtBtn = btn.querySelector('.btn-txt');
-  const svg = btn.querySelector('.btn-icon');
-
-  if (enProc) {
-    btn.disabled = false;
-    btn.classList.add('btn-detener');
-    btn.title = 'Detener ejecución actual';
-    if (txtBtn) txtBtn.textContent = 'Detener Lote';
-    if (svg) {
-      svg.innerHTML = '<rect x="6" y="6" width="12" height="12" rx="1.5" />';
-    }
+  if (wrapper.classList.contains('modo-modal')) {
+    overlay.classList.remove('activo', 'modo-modal');
+    wrapper.classList.remove('modo-modal');
+    wrapper.classList.add('modo-docked');
+    document.body.classList.add('terminal-docked');
+    if (btnDock) btnDock.textContent = '⬆ Centrar Consola';
+    document.body.appendChild(wrapper);
   } else {
-    btn.disabled = false;
-    btn.classList.remove('btn-detener');
-    btn.title = 'Procesar Documentos';
-    if (txtBtn) txtBtn.textContent = 'Procesar Documentos';
-    if (svg) {
-      svg.innerHTML = '<path d="M8 5.14v13.72a1 1 0 0 0 1.5.86l11-6.86a1 1 0 0 0 0-1.72l-11-6.86A1 1 0 0 0 8 5.14z" />';
-    }
+    wrapper.classList.remove('modo-docked');
+    document.body.classList.remove('terminal-docked');
+    overlay.appendChild(wrapper);
+    overlay.classList.add('activo', 'modo-modal');
+    wrapper.classList.add('modo-modal');
+    if (btnDock) btnDock.textContent = '⬇ Anclar Abajo';
   }
 }
 
-function actualizarUIBuzon(expediente) {
-  expedienteEnEscucha = expediente || null;
-  const buzonTxt = document.getElementById('buzonTxt');
-  const buzonPill = document.getElementById('buzonStatus');
-  if (expedienteEnEscucha) {
-    buzonTxt.textContent = `Buzón esperando descargas para: ${expedienteEnEscucha}`;
-    buzonPill.classList.add('activo');
+// Cargar registros desde la API
+async function cargarExpedientes() {
+  try {
+    const res = await fetch('/api/expedientes');
+    expedientesGlobales = await res.json();
+    actualizarMetricas();
+    aplicarFiltrosYOrden();
+  } catch (err) {
+    console.error('Error al obtener expedientes:', err);
+  }
+}
+
+function actualizarMetricas() {
+  const total = expedientesGlobales.length;
+  const completados = expedientesGlobales.filter(e => e.estado === 'Completado').length;
+  const listos = expedientesGlobales.filter(e => e.estado === 'Listo (Con PDFs)').length;
+  const problemas = expedientesGlobales.filter(e => e.tiene_error_manual || e.estado === 'Con Problema').length;
+  const pendientes = expedientesGlobales.filter(e => e.estado === 'Pendiente').length;
+
+  document.getElementById('totalCount').textContent = total;
+  document.getElementById('procesadosCount').textContent = completados;
+  document.getElementById('listosCount').textContent = listos;
+  document.getElementById('errorCount').textContent = problemas;
+  document.getElementById('pendientesCount').textContent = pendientes;
+
+  document.getElementById('badgeTabPendientes').textContent = pendientes + listos;
+  document.getElementById('badgeTabErrores').textContent = problemas;
+  document.getElementById('badgeTabCompletados').textContent = completados;
+  document.getElementById('badgeTabTodos').textContent = total;
+}
+
+function cambiarTab(tab) {
+  filtroTabActual = tab;
+  paginaActual = 1;
+  document.querySelectorAll('.tab-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.getAttribute('data-tab') === tab);
+  });
+  aplicarFiltrosYOrden();
+}
+
+function filtrarPorTexto() {
+  paginaActual = 1;
+  aplicarFiltrosYOrden();
+}
+
+function limpiarBuscador() {
+  const input = document.getElementById('inputBuscador');
+  input.value = '';
+  document.getElementById('btnLimpiarBusqueda').style.display = 'none';
+  aplicarFiltrosYOrden();
+}
+
+function manejarTeclasBuscador(event) {
+  if (event.key === 'Escape') {
+    limpiarBuscador();
+  }
+}
+
+function ordenarPor(columna) {
+  if (columnaOrden === columna) {
+    ordenAsc = !ordenAsc;
   } else {
-    buzonTxt.textContent = 'Buzón inactivo (Clic en "Buzón" en una fila)';
-    buzonPill.classList.remove('activo');
+    columnaOrden = columna;
+    ordenAsc = true;
   }
+  aplicarFiltrosYOrden();
 }
 
-function renderTabla(items) {
-  todosLosItems = items;
+function aplicarFiltrosYOrden() {
+  const input = document.getElementById('inputBuscador');
+  const busqueda = (input ? input.value : '').toLowerCase().trim();
+  const btnLimpiar = document.getElementById('btnLimpiarBusqueda');
+  if (btnLimpiar) btnLimpiar.style.display = busqueda ? 'block' : 'none';
 
-  let cProcesados = 0, cListos = 0, cError = 0, cPendientes = 0;
-  items.forEach(exp => {
-    if (exp.estado === 'error') cError++;
-    else if (exp.estado === 'procesado') cProcesados++;
-    else if (exp.estado === 'listo_para_procesar') cListos++;
-    else cPendientes++;
+  expedientesFiltrados = expedientesGlobales.filter(exp => {
+    if (filtroTabActual === 'pendientes' && (exp.estado === 'Completado' || exp.tiene_error_manual)) return false;
+    if (filtroTabActual === 'errores' && !exp.tiene_error_manual && exp.estado !== 'Con Problema') return false;
+    if (filtroTabActual === 'completados' && exp.estado !== 'Completado') return false;
+
+    if (busqueda) {
+      const match = (exp.id && String(exp.id).toLowerCase().includes(busqueda)) ||
+                    (exp.nombre && exp.nombre.toLowerCase().includes(busqueda)) ||
+                    (exp.expediente && exp.expediente.toLowerCase().includes(busqueda));
+      if (!match) return false;
+    }
+
+    return true;
   });
 
-  const totalActivos = cListos + cPendientes;
+  expedientesFiltrados.sort((a, b) => {
+    let valA = a[columnaOrden] ?? '';
+    let valB = b[columnaOrden] ?? '';
 
-  document.getElementById('totalCount').innerText = items.length;
-  document.getElementById('procesadosCount').innerText = cProcesados;
-  document.getElementById('listosCount').innerText = cListos;
-  document.getElementById('errorCount').innerText = cError;
-  document.getElementById('pendientesCount').innerText = cPendientes;
+    if (columnaOrden === 'id' || columnaOrden === 'monto') {
+      valA = Number(valA) || 0;
+      valB = Number(valB) || 0;
+    }
 
-  document.getElementById('badgeTabPendientes').innerText = totalActivos;
-  document.getElementById('badgeTabErrores').innerText = cError;
-  document.getElementById('badgeTabCompletados').innerText = cProcesados;
-  document.getElementById('badgeTabTodos').innerText = items.length;
+    if (valA < valB) return ordenAsc ? -1 : 1;
+    if (valA > valB) return ordenAsc ? 1 : -1;
+    return 0;
+  });
 
- let filtrados = [];
-  if (tabActual === 'pendientes') {
-    filtrados = items.filter(exp => exp.estado !== 'procesado' && exp.estado !== 'error');
-  } else if (tabActual === 'errores') {
-    filtrados = items.filter(exp => exp.estado === 'error');
-  } else if (tabActual === 'completados') {
-    filtrados = items.filter(exp => exp.estado === 'procesado');
-  } else {
-    filtrados = items;
-  }
+  renderizarTabla();
+}
 
-  // Filtrado reactivo por texto
-  if (textoBusqueda.trim() !== '') {
-    const q = normalizarTextoParaBusqueda(textoBusqueda);
-    filtrados = filtrados.filter(exp => {
-      const nom = normalizarTextoParaBusqueda(exp.nombre || '');
-      const id = String(exp.id || '').toLowerCase();
-      const numExp = normalizarTextoParaBusqueda(exp.expediente || '');
-      const fec = normalizarTextoParaBusqueda(exp.fecha || '');
-      const obs = normalizarTextoParaBusqueda(exp.observacion || '');
-
-      return nom.includes(q) || id.includes(q) || numExp.includes(q) || fec.includes(q) || obs.includes(q);
-    });
-  }
-
-  // Ordenamiento Determinista
-  if (columnaOrden) {
-    filtrados.sort((a, b) => {
-      let resultado = 0;
-
-      if (columnaOrden === 'fecha') {
-        const numA = fechaANumeroComparable(a.fecha);
-        const numB = fechaANumeroComparable(b.fecha);
-        resultado = numA - numB;
-      } else if (columnaOrden === 'id' || columnaOrden === 'monto') {
-        const valA = parseFloat(a[columnaOrden]) || 0;
-        const valB = parseFloat(b[columnaOrden]) || 0;
-        resultado = valA - valB;
-      } else {
-        const strA = (a[columnaOrden] || '').toString();
-        const strB = (b[columnaOrden] || '').toString();
-        resultado = strA.localeCompare(strB, 'es', { sensitivity: 'base', numeric: true });
-      }
-
-      if (resultado === 0) {
-        resultado = (a.expediente || '').localeCompare(b.expediente || '');
-      }
-
-      return ordenAscendente ? resultado : -resultado;
-    });
-  }
-
-  const totalPaginas = Math.max(1, Math.ceil(filtrados.length / filasPorPagina));
-  if (paginaActual > totalPaginas) paginaActual = totalPaginas;
-  if (paginaActual < 1) paginaActual = 1;
-
-  const inicio = (paginaActual - 1) * filasPorPagina;
-  const fin = Math.min(inicio + filasPorPagina, filtrados.length);
-  const itemsPagina = filtrados.slice(inicio, fin);
-
-  document.getElementById('btnPrevPage').disabled = paginaActual === 1;
-  document.getElementById('btnNextPage').disabled = paginaActual === totalPaginas || filtrados.length === 0;
-  document.getElementById('paginationCurrent').innerText = `Pág. ${paginaActual} de ${totalPaginas}`;
-  document.getElementById('paginationInfo').innerText = filtrados.length > 0
-    ? `Mostrando ${inicio + 1}-${fin} de ${filtrados.length}`
-    : 'Sin registros';
-
- if (document.activeElement && document.activeElement.classList.contains('input-obs')) return;
-
+function renderizarTabla() {
   const tbody = document.getElementById('tablaBody');
   tbody.innerHTML = '';
 
-  itemsPagina.forEach(exp => {
+  const total = expedientesFiltrados.length;
+  const totalPaginas = Math.ceil(total / filasPorPagina) || 1;
+
+  if (paginaActual > totalPaginas) paginaActual = totalPaginas;
+
+  const inicio = (paginaActual - 1) * filasPorPagina;
+  const fin = Math.min(inicio + filasPorPagina, total);
+  const paginaItems = expedientesFiltrados.slice(inicio, fin);
+
+  paginaItems.forEach(exp => {
     const tr = document.createElement('tr');
-    tr.className = exp.estado;
+    let claseFila = 'pendiente';
+    let claseBadge = 'badge-pendiente';
 
-    if (exp.expediente === expedienteEnEscucha) {
-      tr.classList.add('fila-escuchando');
+    if (exp.estado === 'Completado') {
+      claseFila = 'procesado';
+      claseBadge = 'badge-procesado';
+    } else if (exp.estado === 'Listo (Con PDFs)') {
+      claseFila = 'listo_para_procesar';
+      claseBadge = 'badge-listo';
+    } else if (exp.tiene_error_manual || exp.estado === 'Con Problema') {
+      claseFila = 'error';
+      claseBadge = 'badge-error';
     }
 
-    configurarDragAndDropFila(tr, exp);
-
-    let badgeHtml = '';
-    if (exp.estado === 'error') badgeHtml = '<span class="badge badge-error">Con Error</span>';
-    else if (exp.estado === 'procesado') badgeHtml = '<span class="badge badge-procesado">Completado</span>';
-    else if (exp.estado === 'listo_para_procesar') badgeHtml = '<span class="badge badge-listo">Listo (Con PDFs)</span>';
-    else badgeHtml = '<span class="badge badge-pendiente">Pendiente</span>';
-
-    const esProcesado = exp.estado === 'procesado';
-    const estaListo = exp.estado === 'listo_para_procesar';
-    const puedeAbrirEntrada = Boolean(exp.carpetaExiste || estaListo);
-    const tieneArchivosEntrada = Boolean(exp.tienePdfs || estaListo);
-    const puedeBorrar = puedeAbrirEntrada;
-
-    let grupoAcciones = '';
-
-    if (esProcesado) {
-      grupoAcciones = `
-        <div class="acciones-btn-group">
-          <button class="btn-action-pill btn-action-view"
-            onclick="abrirArchivoSalida('${exp.expediente}')"
-            title="Abrir PDF unificado en el visor">
-            <svg viewBox="0 0 24 24">
-              <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-              <circle cx="12" cy="12" r="3"/>
-            </svg>
-            <span class="txt">Ver PDF</span>
-          </button>
-
-          <button class="btn-action-pill btn-action-folder"
-            onclick="abrirCarpetaSalida('${exp.fecha}', '${exp.expediente}')"
-            title="Abrir carpeta de salida en el explorador">
-            <svg viewBox="0 0 24 24">
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-            </svg>
-            <span class="txt">Salida</span>
-          </button>
-
-          <button class="btn-action-pill btn-action-clear"
-            onclick="reprocesarExpediente('${exp.expediente}')"
-            title="Borrar archivo generado para reprocesar">
-            <svg viewBox="0 0 24 24">
-              <polyline points="3 6 5 6 21 6"/>
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-            </svg>
-            <span class="txt">Rehacer</span>
-          </button>
-        </div>
-      `;
-    } else {
-      const esActivoBuzon = (exp.expediente === expedienteEnEscucha);
-      const textoBorrar = tieneArchivosEntrada ? 'Vaciar' : 'Borrar';
-      const tooltipBorrar = tieneArchivosEntrada
-        ? 'Vaciar los PDFs de este expediente'
-        : 'Eliminar la carpeta del expediente';
-
-      grupoAcciones = `
-        <div class="acciones-btn-group">
-          <button class="btn-action-pill btn-action-buzon ${esActivoBuzon ? 'activo' : ''}"
-            onclick="toggleEscuchaBuzon('${exp.fecha}', '${exp.id}', '${encodeURIComponent(exp.nombre)}', '${exp.expediente}')"
-            title="${esActivoBuzon ? 'Desactivar escucha' : 'Asignar descargas a este expediente'}">
-            <svg viewBox="0 0 24 24">
-              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
-              <polyline points="7 10 12 15 17 10"/>
-              <line x1="12" y1="15" x2="12" y2="3"/>
-            </svg>
-            <span class="txt">${esActivoBuzon ? 'Escuchando' : 'Buzón'}</span>
-          </button>
-
-          <button class="btn-action-pill btn-action-folder"
-            ${!puedeAbrirEntrada ? 'disabled' : ''}
-            onclick="abrirCarpetaExpediente('${exp.fecha}', '${exp.expediente}')"
-            title="${puedeAbrirEntrada ? 'Abrir carpeta en el explorador' : 'Carpeta no creada'}">
-            <svg viewBox="0 0 24 24">
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-            </svg>
-            <span class="txt">Abrir</span>
-          </button>
-
-          <button class="btn-action-pill btn-action-clear"
-            ${!puedeBorrar ? 'disabled' : ''}
-            onclick="limpiarCarpetaExpediente('${exp.fecha}', '${exp.expediente}', ${tieneArchivosEntrada})"
-            title="${puedeBorrar ? tooltipBorrar : 'No hay carpeta para borrar'}">
-            <svg viewBox="0 0 24 24">
-              <polyline points="3 6 5 6 21 6"/>
-              <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/>
-            </svg>
-            <span class="txt">${textoBorrar}</span>
-          </button>
-        </div>
-      `;
-    }
+    tr.className = claseFila;
+    const montoFormateado = exp.monto ? `$${Number(exp.monto).toLocaleString('es-AR', { minimumFractionDigits: 2 })}` : '-';
 
     tr.innerHTML = `
-      <td>${exp.fecha}</td>
-      <td><strong>${exp.id}</strong></td>
-      <td>${exp.nombre}</td>
+      <td>${formatearFecha(exp.fecha)}</td>
+      <td><strong>${exp.id || '-'}</strong></td>
+      <td>${exp.nombre || '-'}</td>
       <td>
-        <div class="exp-pill" onclick="abrirMenuGde(event, '${exp.expediente}')" title="Clic para copiar">
-          📄 ${exp.expediente}
+        <span class="exp-pill" onclick="abrirPopoverGde(event, '${exp.expediente}')">${exp.expediente}</span>
+      </td>
+      <td>${montoFormateado}</td>
+      <td><span class="badge ${claseBadge}">${exp.estado}</span></td>
+      <td>
+        <div class="acciones-btn-group">
+          <button class="btn-action-pill btn-action-buzon" title="Vincular Buzón">
+            <svg viewBox="0 0 24 24"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"></path><polyline points="22,6 12,13 2,6"></polyline></svg>
+            <span class="txt">Buzón</span>
+          </button>
+          <button class="btn-action-pill btn-action-folder" title="Abrir Carpeta Entrada">
+            <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
+            <span class="txt">Carpeta</span>
+          </button>
         </div>
       </td>
-      <td>$${exp.monto ? exp.monto.toLocaleString('es-AR', { minimumFractionDigits: 2 }) : '0,00'}</td>
-      <td>${badgeHtml}</td>
-      <td>${grupoAcciones}</td>
       <td style="text-align: center;">
-        <input type="checkbox" class="checkbox-error"
-          ${exp.tieneErrorManual ? 'checked' : ''}
-          ${exp.estado === 'procesado' ? 'disabled' : ''}
-          onchange="cambiarError('${exp.expediente}', this.checked, '${encodeURIComponent(exp.observacion)}', this)">
+        <input type="checkbox" class="checkbox-error" ${exp.tiene_error_manual ? 'checked' : ''} onchange="cambiarErrorManual('${exp.expediente}', this.checked)">
       </td>
       <td>
-        <input type="text" class="input-obs" value="${exp.observacion.replace(/"/g, '&quot;')}"
-          placeholder="Anotar observación o detalle..."
-          onblur="guardarNota('${exp.expediente}', this.value, ${exp.tieneErrorManual})">
+        <input type="text" class="input-obs" value="${exp.observacion || ''}" placeholder="Anotar observación..." onblur="actualizarObservacion('${exp.expediente}', this.value)">
       </td>
     `;
+
     tbody.appendChild(tr);
   });
+
+  document.getElementById('paginationInfo').textContent = `Mostrando ${total === 0 ? 0 : inicio + 1}-${fin} de ${total}`;
+  document.getElementById('paginationCurrent').textContent = `Pág. ${paginaActual} de ${totalPaginas}`;
+  document.getElementById('btnPrevPage').disabled = paginaActual <= 1;
+  document.getElementById('btnNextPage').disabled = paginaActual >= totalPaginas;
 }
 
-function configurarDragAndDropFila(tr, exp) {
-  tr.addEventListener('dragover', (e) => {
-    e.preventDefault();
-    tr.classList.add('drop-target');
+function cambiarFilasPorPagina(val) {
+  filasPorPagina = parseInt(val, 10);
+  paginaActual = 1;
+  aplicarFiltrosYOrden();
+}
+
+function cambiarPagina(delta) {
+  paginaActual += delta;
+  renderizarTabla();
+}
+
+// Control visual del estado de ejecución del Bot
+function setBotEstado(activo) {
+  botEnEjecucion = activo;
+  const btn = document.getElementById('btnIniciarBot');
+  const btnTermCancelar = document.getElementById('btnTermCancelar');
+  const txtSpan = btn ? btn.querySelector('.btn-txt') : null;
+
+  if (activo) {
+    if (btn) {
+      btn.classList.remove('btn-bot', 'btn-primary');
+      btn.classList.add('btn-detener');
+    }
+    if (txtSpan) txtSpan.textContent = 'Detener Bot';
+    if (btnTermCancelar) {
+      btnTermCancelar.style.display = 'inline-flex';
+      btnTermCancelar.textContent = '⏹ Detener Bot';
+    }
+  } else {
+    if (btn) {
+      btn.classList.remove('btn-detener');
+      btn.classList.add('btn-bot');
+    }
+    if (txtSpan) txtSpan.textContent = 'Descargar de GDE (Bot)';
+    if (btnTermCancelar) {
+      btnTermCancelar.style.display = 'none';
+    }
+  }
+}
+
+// Iniciar o Detener Scraper según el estado
+async function toggleScraperGDE() {
+  if (botEnEjecucion) {
+    await detenerScraperGDE();
+  } else {
+    await iniciarScraperGDE();
+  }
+}
+
+async function iniciarScraperGDE() {
+  try {
+    setBotEstado(true);
+    const res = await fetch('/api/iniciar-scraper', { method: 'POST' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.mensaje || 'Error al iniciar bot');
+    abrirTerminalModal();
+  } catch (err) {
+    setBotEstado(false);
+    alert('Error al iniciar el scraper: ' + err.message);
+  }
+}
+
+async function detenerScraperGDE() {
+  try {
+    const res = await fetch('/api/detener-scraper', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) {
+      setBotEstado(false);
+    }
+  } catch (err) {
+    alert('Error al solicitar detención: ' + err.message);
+  }
+}
+
+// Enlazar la acción de cancelar en la barra superior de la terminal
+function cancelarProcesoDesdeTerminal() {
+  detenerScraperGDE();
+}
+
+async function cambiarErrorManual(expediente, valor) {
+  await fetch('/api/guardar-observacion', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expediente, tiene_error_manual: valor })
   });
+}
 
-  tr.addEventListener('dragleave', () => {
-    tr.classList.remove('drop-target');
-  });
-
-  tr.addEventListener('drop', async (e) => {
-    e.preventDefault();
-    tr.classList.remove('drop-target');
-
-    const archivos = Array.from(e.dataTransfer.files).filter(f => f.name.toLowerCase().endsWith('.pdf'));
-    if (archivos.length === 0) {
-      mostrarToast('⚠️ Arrastrá solo archivos PDF');
-      return;
-    }
-
-    const formData = new FormData();
-    formData.append('fecha', exp.fecha);
-    formData.append('id', exp.id);
-    formData.append('nombre', exp.nombre);
-    formData.append('expediente', exp.expediente);
-
-    archivos.forEach(arch => formData.append('pdfs', arch));
-
-    mostrarToast(`Subiendo ${archivos.length} PDF(s) a ${exp.expediente}...`);
-    try {
-      const res = await fetch('/api/subir-pdfs-expediente', {
-        method: 'POST',
-        body: formData
-      });
-      if (res.ok) {
-        mostrarToast(`✓ ${archivos.length} archivo(s) guardados correctamente`);
-      } else {
-        alert('Error al subir archivos');
-      }
-    } catch (err) {
-      console.error(err);
-      alert('Fallo de conexión al soltar archivos');
-    }
+async function actualizarObservacion(expediente, valor) {
+  await fetch('/api/guardar-observacion', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expediente, observacion: valor })
   });
 }
 
-async function toggleEscuchaBuzon(fecha, id, nombreEncoded, expediente) {
-  const nombre = decodeURIComponent(nombreEncoded);
+async function subirExcel() {
+  const input = document.getElementById('inputExcel');
+  const archivo = input.files[0];
+  if (!archivo) return;
 
-  const nuevoEstado = (expedienteEnEscucha === expediente)
-    ? {}
-    : { fecha, id, nombre, expediente };
-
-  actualizarUIBuzon(nuevoEstado.expediente || null);
-  renderTabla(todosLosItems);
+  const formData = new FormData();
+  formData.append('archivo', archivo);
 
   try {
-    await fetch('/api/activar-escucha', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(nuevoEstado)
-    });
-    if (nuevoEstado.expediente) {
-      mostrarToast(`📥 Asignando descargas a: ${expediente}`);
-    } else {
-      mostrarToast(`Escucha desactivada`);
-    }
-  } catch (err) {
-    console.error(err);
-  }
-}
-
-async function abrirCarpetaExpediente(fecha, expediente) {
-  try {
-    const res = await fetch('/api/abrir-carpeta', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fecha, expediente })
-    });
-    if (res.ok) {
-      mostrarToast(`Abriendo carpeta de ${expediente}...`);
-    } else {
-      mostrarToast(`⚠️ La carpeta no existe`);
-    }
-  } catch (err) {
-    console.error('Error abriendo carpeta:', err);
-  }
-}
-
-async function abrirArchivoSalida(expediente) {
-  try {
-    const res = await fetch('/api/abrir-archivo-salida', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expediente })
-    });
-    if (res.ok) {
-      mostrarToast(`Abriendo documento unificado de ${expediente}...`);
-    } else {
-      mostrarToast(`⚠️ No se encontró el PDF generado`);
-    }
-  } catch (err) {
-    console.error('Error abriendo PDF de salida:', err);
-  }
-}
-
-async function abrirCarpetaSalida(fecha, expediente) {
-  try {
-    const res = await fetch('/api/abrir-carpeta-salida', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fecha, expediente })
-    });
-    if (res.ok) {
-      mostrarToast(`Abriendo carpeta de salida...`);
-    } else {
-      mostrarToast(`⚠️ No se pudo abrir la carpeta de salida`);
-    }
-  } catch (err) {
-    console.error('Error abriendo carpeta de salida:', err);
-  }
-}
-
-async function reprocesarExpediente(expediente) {
-  const confirmar = confirm(
-    `¿Querés eliminar el PDF unificado de salida de ${expediente}?\n\n` +
-    `El expediente volverá a estado "Listo (Con PDFs)" para que puedas volver a procesarlo.`
-  );
-  if (!confirmar) return;
-
-  try {
-    const res = await fetch('/api/limpiar-salida-expediente', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expediente })
-    });
-    if (res.ok) {
-      mostrarToast(`✓ PDF de salida eliminado. Listo para reprocesar.`);
-    } else {
-      mostrarToast(`⚠️ No se pudo eliminar el PDF de salida`);
-    }
-  } catch (err) {
-    console.error('Error al reprocesar salida:', err);
-  }
-}
-
-async function limpiarCarpetaExpediente(fecha, expediente, tienePdfs) {
-  const mensajeConfirmacion = tienePdfs
-    ? `¿Querés vaciar los archivos PDFs de ${expediente}?`
-    : `La carpeta está vacía. ¿Querés eliminar la carpeta del expediente ${expediente}?`;
-
-  const confirmar = confirm(mensajeConfirmacion);
-  if (!confirmar) return;
-
-  try {
-    const res = await fetch('/api/limpiar-carpeta-expediente', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ fecha, expediente })
-    });
+    const res = await fetch('/api/subir-excel', { method: 'POST', body: formData });
     const data = await res.json();
     if (res.ok) {
-      if (data.accion === 'vaciada') {
-        mostrarToast(`✓ PDFs eliminados. Clic de nuevo para borrar la carpeta.`);
-      } else {
-        mostrarToast(`✓ Carpeta eliminada por completo.`);
-      }
+      document.getElementById('archivoCargadoTxt').textContent = `Archivo: ${archivo.name}`;
+      cargarExpedientes();
     } else {
-      mostrarToast(`⚠️ ${data.error || 'No se pudo realizar la acción'}`);
+      alert('Error al procesar el Excel: ' + data.error);
     }
   } catch (err) {
-    console.error('Error al limpiar carpeta:', err);
+    alert('Error en la comunicación con el servidor: ' + err.message);
   }
 }
 
-function abrirMenuGde(event, expedienteRaw) {
-  event.stopPropagation();
+async function resetearTodo() {
+  if (confirm('¿Estás seguro de que deseas vaciar y resetear todos los datos de la base?')) {
+    await fetch('/api/resetear', { method: 'POST' });
+  }
+}
+
+function abrirPopoverGde(event, exp) {
   const popover = document.getElementById('popoverGde');
-  const optMee = `EX-${expedienteRaw}- -TRHONDO-MEE#SEH`;
-  const optMeg = `EX-${expedienteRaw}- -TRHONDO-MEG#INT`;
+  const rect = event.target.getBoundingClientRect();
+  const expLimpio = exp.replace(/^EX-/, '').replace(/-\s*-TRHONDO.*$/, '');
+
+  const txtMee = `EX-${expLimpio}- -TRHONDO-MEE#SEH`;
+  const txtMeg = `EX-${expLimpio}- -TRHONDO-MEG#INT`;
 
   const btnMee = document.getElementById('btnGdeMee');
   const btnMeg = document.getElementById('btnGdeMeg');
 
-  btnMee.querySelector('.txt').textContent = optMee;
-  btnMee.dataset.copiar = optMee;
+  btnMee.querySelector('.txt').textContent = txtMee;
+  btnMee.setAttribute('data-copy', txtMee);
 
-  btnMeg.querySelector('.txt').textContent = optMeg;
-  btnMeg.dataset.copiar = optMeg;
+  btnMeg.querySelector('.txt').textContent = txtMeg;
+  btnMeg.setAttribute('data-copy', txtMeg);
 
+  popover.style.top = `${rect.bottom + window.scrollY + 6}px`;
+  popover.style.left = `${rect.left + window.scrollX}px`;
   popover.style.display = 'block';
-  popover.style.top = `${event.pageY + 10}px`;
-  popover.style.left = `${Math.min(event.pageX, window.innerWidth - 350)}px`;
 }
 
 function cerrarPopover() {
   document.getElementById('popoverGde').style.display = 'none';
 }
 
-document.addEventListener('click', (e) => {
-  const pop = document.getElementById('popoverGde');
-  if (pop && !pop.contains(e.target)) cerrarPopover();
-});
-
-async function copiarTextoGde(btnElement) {
-  const texto = btnElement.dataset.copiar;
-  if (!texto) return;
-
-  try {
-    await navigator.clipboard.writeText(texto);
-  } catch (_) {
-    const temp = document.createElement('textarea');
-    temp.value = texto;
-    document.body.appendChild(temp);
-    temp.select();
-    document.execCommand('copy');
-    document.body.removeChild(temp);
-  }
-
-  cerrarPopover();
-  mostrarToast(`Copiado: ${texto}`);
-}
-
-function mostrarToast(mensaje) {
-  const toast = document.getElementById('toastCopiado');
-  toast.textContent = mensaje;
-  toast.style.display = 'block';
-  setTimeout(() => { toast.style.display = 'none'; }, 2200);
-}
-
-async function subirExcel() {
-  const input = document.getElementById('inputExcel');
-  if (!input.files || input.files.length === 0) return;
-
-  const formData = new FormData();
-  formData.append('excel', input.files[0]);
-
-  await fetch('/api/upload-excel', { method: 'POST', body: formData });
-}
-
-async function cambiarError(expediente, tieneError, obsEncoded, inputCheckbox) {
-  const observacion = decodeURIComponent(obsEncoded);
-  try {
-    await fetch('/api/guardar-observacion', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expediente, observacion, tieneErrorManual: tieneError })
-    });
-  } catch (err) {
-    console.error('Error al guardar estado de error:', err);
-    inputCheckbox.checked = !tieneError;
-  }
-}
-
-async function guardarNota(expediente, valor, tieneErrorManual) {
-  await fetch('/api/guardar-observacion', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ expediente, observacion: valor, tieneErrorManual })
+function copiarTextoGde(btn) {
+  const texto = btn.getAttribute('data-copy');
+  navigator.clipboard.writeText(texto).then(() => {
+    cerrarPopover();
+    const toast = document.getElementById('toastCopiado');
+    toast.style.display = 'block';
+    setTimeout(() => { toast.style.display = 'none'; }, 2000);
   });
 }
 
-async function cancelarProcesoDesdeTerminal() {
-  if (!procesoActivo) return;
-
-  const confirmar = confirm('¿Seguro que querés DETENER el proceso de lotes en ejecución?');
-  if (!confirmar) return;
-
-  try {
-    const res = await fetch('/api/cancelar-proceso', { method: 'POST' });
-    const data = await res.json();
-    if (!res.ok) {
-      alert(data.error || 'No se pudo detener el proceso.');
-    } else {
-      mostrarToast('⚠️ Deteniendo lote...');
-    }
-  } catch (err) {
-    console.error('Error al solicitar detención:', err);
-  }
-}
-
-async function iniciarProceso() {
-  if (procesoActivo) {
-    const confirmar = confirm('¿Seguro que querés DETENER el proceso de lotes en ejecución?');
-    if (!confirmar) return;
-
-    try {
-      const res = await fetch('/api/cancelar-proceso', { method: 'POST' });
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.error || 'No se pudo detener el proceso.');
-      } else {
-        mostrarToast('⚠️ Deteniendo lote...');
-      }
-    } catch (err) {
-      console.error('Error al solicitar detención:', err);
-    }
-    return;
-  }
-
-  actualizarUIProceso(true);
-  abrirTerminalModal();
-
-  try {
-    const res = await fetch('/api/procesar', { method: 'POST' });
-    const data = await res.json().catch(() => ({}));
-
-    if (!res.ok) {
-      const term = document.getElementById('terminalLogs');
-      term.textContent = `[ERROR DE SERVIDOR]: ${data.error || 'Código HTTP ' + res.status}`;
-      actualizarUIProceso(false);
-    }
-  } catch (err) {
-    console.error('Error al iniciar proceso:', err);
-    const term = document.getElementById('terminalLogs');
-    term.textContent = `[ERROR DE RED]: ${err.message}`;
-    actualizarUIProceso(false);
-  }
-}
-
-async function resetearTodo() {
-  const confirmacion = confirm(
-    '¿Estás seguro de que querés resetear TODO?\n\n' +
-    '• Se borrarán todos los PDFs de entrada, salida y buzón.\n' +
-    '• Se eliminará la planilla Excel cargada.\n' +
-    '• Se borrarán las observaciones y marcas de error.\n\n' +
-    'Esta acción no se puede deshacer.'
-  );
-
-  if (!confirmacion) return;
-
-  try {
-    const res = await fetch('/api/reset-todo', { method: 'POST' });
-    const data = await res.json();
-
-    if (!res.ok) {
-      alert(`Error: ${data.error || 'No se pudo resetear'}`);
-      return;
-    }
-
-    renderTabla([]);
-    document.getElementById('terminalLogs').textContent = 'Esperando órdenes...';
-    mostrarToast('✓ Sistema reseteado a cero');
-  } catch (err) {
-    console.error(err);
-    alert('Error al contactar con el servidor.');
-  }
-}
-
-function mostrarBannerReconexion(visible, texto) {
-  const banner = document.getElementById('bannerConexion');
-  const txt = document.getElementById('bannerConexionTxt');
-  if (!banner) return;
-
-  if (visible) {
-    if (txt && texto) txt.textContent = texto;
-    banner.style.display = 'inline-flex';
-  } else {
-    banner.style.display = 'none';
-  }
-}
-
-function conectarSSE() {
-  if (timerReintentoSSE) {
-    clearTimeout(timerReintentoSSE);
-    timerReintentoSSE = null;
-  }
-
-  const sse = new EventSource('/api/stream');
-
-  sse.onopen = () => {
-    mostrarBannerReconexion(false);
-  };
-
-  sse.addEventListener('init', (e) => {
-    mostrarBannerReconexion(false);
-    const data = JSON.parse(e.data);
-    actualizarUIProceso(data.enProceso);
-    actualizarUIBuzon(data.expedienteActivoBuzon?.expediente);
-    document.getElementById('archivoCargadoTxt').textContent = data.archivoCargado
-      ? `Planilla activa: ${data.archivoCargado}`
-      : '⚠️ Ningún archivo Excel cargado';
-
-    const term = document.getElementById('terminalLogs');
-    if (data.logs) {
-      term.innerHTML = formatearLogsConColores(data.logs);
-      hacerScrollAlFondoTerminal();
-    }
-
-    if (Array.isArray(data.expedientes)) {
-      ultimoJsonExpedientes = JSON.stringify(data.expedientes);
-      todosLosItems = [...data.expedientes];
-      renderTabla(todosLosItems);
-    }
-  });
-
-  sse.addEventListener('estado', (e) => {
-    const data = JSON.parse(e.data);
-    actualizarUIProceso(data.enProceso);
-    actualizarUIBuzon(data.expedienteActivoBuzon?.expediente);
-    document.getElementById('archivoCargadoTxt').textContent = data.archivoCargado
-      ? `Planilla activa: ${data.archivoCargado}`
-      : '⚠️ Ningún archivo Excel cargado';
-
-    if (Array.isArray(data.expedientes)) {
-      const nuevoJson = JSON.stringify(data.expedientes);
-      if (nuevoJson !== ultimoJsonExpedientes) {
-        ultimoJsonExpedientes = nuevoJson;
-        todosLosItems = [...data.expedientes];
-        renderTabla(todosLosItems);
-      }
-    }
-  });
-
-  sse.addEventListener('estado_proceso', (e) => {
-    const data = JSON.parse(e.data);
-    actualizarUIProceso(data.enProceso);
-  });
-
-  sse.addEventListener('buzon', (e) => {
-    const data = JSON.parse(e.data);
-    actualizarUIBuzon(data.expedienteActivoBuzon?.expediente);
-    renderTabla(todosLosItems);
-  });
-
-  sse.addEventListener('log', (e) => {
-    const data = JSON.parse(e.data);
-    const term = document.getElementById('terminalLogs');
-
-    if (data.reset) {
-      term.innerHTML = formatearLogsConColores(data.log);
-      return;
-    }
-
-    const estabaAlFondo = (term.scrollHeight - term.scrollTop - term.clientHeight) < 60;
-    term.innerHTML += formatearLogsConColores(data.log);
-
-    if (estabaAlFondo || modoTerminal !== 'cerrada') {
-      term.scrollTop = term.scrollHeight;
-    }
-  });
-
-  sse.onerror = () => {
-    mostrarBannerReconexion(true, 'Conexión perdida. Reconectando con el servidor...');
-    sse.close();
-    timerReintentoSSE = setTimeout(conectarSSE, 2500);
-  };
-}
-
-conectarSSE();
-
-function normalizarTextoParaBusqueda(str) {
-  return String(str || '')
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .toLowerCase()
-    .trim();
-}
-
-function filtrarPorTexto(val) {
-  textoBusqueda = val;
-  paginaActual = 1;
-  const btnClear = document.getElementById('btnLimpiarBusqueda');
-  if (btnClear) {
-    btnClear.style.display = val.trim().length > 0 ? 'block' : 'none';
-  }
-  renderTabla(todosLosItems);
-}
-
-function limpiarBuscador() {
-  const input = document.getElementById('inputBuscador');
-  if (input) {
-    input.value = '';
-    input.focus();
-  }
-  filtrarPorTexto('');
-}
-
-function manejarTeclasBuscador(e) {
-  if (e.key === 'Escape') {
-    limpiarBuscador();
-  }
-}
-
-// Atajo global: presionar "/" o "Ctrl + K" enfoca el buscador
+// Atajo de teclado: presionar '/' para enfocar el buscador
 document.addEventListener('keydown', (e) => {
-  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
-
-  if (e.key === '/' || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k')) {
+  if (e.key === '/' && document.activeElement.tagName !== 'INPUT') {
     e.preventDefault();
     const input = document.getElementById('inputBuscador');
-    if (input) {
-      input.focus();
-      input.select();
-    }
+    if (input) input.focus();
   }
+});
+
+window.addEventListener('DOMContentLoaded', () => {
+  inicializarEventosSSE();
+  cargarExpedientes();
 });

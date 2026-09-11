@@ -204,7 +204,7 @@ function extraerDatos(texto, nombreArchivo) {
   const matchMonto = tPlano.match(/\$\s?([\d.,]+)/);
   if (matchMonto) datos.monto = matchMonto[1].trim();
 
-  // 3. CUIT
+  // 3. CUIT (ignorar CUIT de la municipalidad)
   const matchesCuit = [...tPlano.matchAll(/(?:CUIT(?:\s*N[°º])?[:\s]*)(\d{2}-?\d{8}-?\d{1})/gi)];
   for (const m of matchesCuit) {
     const c = m[1].replace(/-/g, '');
@@ -261,6 +261,7 @@ function extraerDatos(texto, nombreArchivo) {
     if (mNom) datos.factura = normalizarFactura(mNom[1], mNom[2]);
   }
 
+  // Titular
   for (const l of lineas) {
     const matchTes = l.match(/Tesorer.*?a:\s*([A-Za-z\s]{4,40})/i);
     if (matchTes) { datos.titular = limpiarNombre(matchTes[1]); break; }
@@ -279,11 +280,13 @@ function extraerDatos(texto, nombreArchivo) {
   return datos;
 }
 
+// Matriz de orden oficial de compaginación
 function calcularPrioridadDocumento(doc) {
   const texto = normalizarTexto(doc.textoCompleto || '');
   const nombre = normalizarTexto(doc.nombreArchivo || '');
   const todo = `${nombre} ${texto}`;
 
+  // 1. Comprobante de Pago (Transferencia / Débito BSE)
   if (
     todo.includes('COMPROBANTE DE TRANSFERENCIA') ||
     todo.includes('BANCO SANTIAGO DEL ESTERO') ||
@@ -293,76 +296,90 @@ function calcularPrioridadDocumento(doc) {
     return { prioridad: 10, tipo: 'COMPROBANTE_TRANSFERENCIA' };
   }
 
-  if (
-    todo.includes('ORDEN DE PAGO FINANCIERA') ||
-    todo.includes('OPF') ||
-    (todo.includes('ORDEN DE PAGO') && todo.includes('PAGUESE POR TESORERIA'))
-  ) {
-    return { prioridad: 90, tipo: 'ORDEN_PAGO_FINANCIERA' };
-  }
-
+  // 2. Retenciones (Ganancias / SICORE)
   if (
     todo.includes('SI.CO.RE') ||
     todo.includes('SICORE') ||
     todo.includes('SISTEMA DE CONTROL DE RETENCIONES') ||
-    todo.includes('IMPTO. A LAS GANANCIAS')
+    todo.includes('IMPTO. A LAS GANANCIAS') ||
+    nombre.includes('SICORE')
   ) {
     return { prioridad: 20, tipo: 'RETENCION_SICORE' };
   }
 
+  // 3. Retenciones (IIBB / Rentas - aun con monto 0 o exentas)
   if (
     todo.includes('DIRECCION GENERAL DE RENTAS') ||
     todo.includes('IMPUESTO SOBRE LOS INGRESOS BRUTOS') ||
     todo.includes('FORMULARIO F.12') ||
-    nombre.includes('IIBB')
+    todo.includes('RETENCION DE INGRESOS BRUTOS') ||
+    nombre.includes('IIBB') ||
+    nombre.includes('RENTAS')
   ) {
-    return { prioridad: 30, tipo: 'RETENCION_IIBB' };
+    return { prioridad: 25, tipo: 'RETENCION_IIBB' };
   }
 
+  // 4. Retenciones (Seguridad Social / SUSS)
   if (
     todo.includes('SEGURIDAD SOCIAL') ||
     todo.includes('SUSS') ||
     todo.includes('CONTRIB.SEG.SOCIAL') ||
-    todo.includes('F.2004')
+    todo.includes('F.2004') ||
+    nombre.includes('SUSS')
   ) {
-    return { prioridad: 40, tipo: 'RETENCION_SUSS' };
+    return { prioridad: 30, tipo: 'RETENCION_SUSS' };
   }
 
+  // 5. Decretos
   if (
     todo.includes('DECRETO') ||
     nombre.includes('DECRETO') ||
     todo.includes('VISTO Y CONSIDERANDO')
   ) {
-    return { prioridad: 50, tipo: 'DECRETO' };
+    return { prioridad: 40, tipo: 'DECRETO' };
   }
 
+  // 6. Contratos de Locación / Servicios
   if (
     todo.includes('CONTRATO DE LOCACION') ||
     todo.includes('CONTRATO DE SERVICIOS') ||
     todo.includes('CONTRATO') ||
     nombre.includes('CONTRATO')
   ) {
-    return { prioridad: 60, tipo: 'CONTRATO' };
+    return { prioridad: 50, tipo: 'CONTRATO' };
   }
 
+  // 7. Actas de Recepción o Certificados
   if (
     todo.includes('ACTA DE RECEPCION') ||
     todo.includes('RECEPCION') ||
+    todo.includes('CERTIFICADO DE SERVICIO') ||
     nombre.includes('ACTA')
   ) {
-    return { prioridad: 70, tipo: 'ACTA' };
+    return { prioridad: 60, tipo: 'ACTA' };
   }
 
+  // 8. Facturas AFIP
   if (
     todo.includes('TIQUE FACTURA') ||
     todo.includes('FACTURA') ||
     todo.includes('PUNTO DE VENTA') ||
     nombre.includes('FAC')
   ) {
-    return { prioridad: 80, tipo: 'FACTURA' };
+    return { prioridad: 70, tipo: 'FACTURA' };
   }
 
-  return { prioridad: 85, tipo: 'OTRO' };
+  // 9. OPF (Va al final de la compaginación)
+  if (
+    todo.includes('ORDEN DE PAGO FINANCIERA') ||
+    todo.includes('OPF') ||
+    (todo.includes('ORDEN DE PAGO') && todo.includes('PAGUESE POR TESORERIA')) ||
+    nombre.includes('OPF')
+  ) {
+    return { prioridad: 90, tipo: 'ORDEN_PAGO_FINANCIERA' };
+  }
+
+  return { prioridad: 80, tipo: 'OTRO' };
 }
 
 function parsearNombreCarpetaExpediente(nombreCarpeta) {
@@ -524,7 +541,7 @@ async function procesarSubcarpetaExpediente(carpetaExpediente, carpetaFecha, map
       if (coincideTitular) {
         console.log(`  [OK EXCEL] Titular validado contra los comprobantes.`);
       } else {
-        mensajeErrorExcel = `DISCREPANCIA: Excel indica "${infoExcel.nombre}" pero los PDFs descargados corresponden a otra persona`;
+        mensajeErrorExcel = `DISCREPANCIA: Excel indica "${infoExcel.nombre}" pero los PDFs corresponden a otra persona`;
         console.warn(`\n[ALERTA CRÍTICA] ${mensajeErrorExcel}`);
         validacionCorrecta = false;
         errorTitularExcel = true;
@@ -555,7 +572,7 @@ async function procesarSubcarpetaExpediente(carpetaExpediente, carpetaFecha, map
     }
   }
 
-  console.log('\n--- Control de Número de Factura ---');
+  console.log('\n--- Control de Facturas y Retenciones (Tolerante a $0) ---');
   const facFisica = facturaDoc?.factura || null;
   const facOPF = opf?.factura || null;
   const tieneRetencion = !!retencionDoc;
@@ -563,7 +580,7 @@ async function procesarSubcarpetaExpediente(carpetaExpediente, carpetaFecha, map
 
   console.log(`  • Factura física: ${facFisica ? facFisica.replace('-', ' N° ') : 'No detectada'}`);
   console.log(`  • En OPF: ${facOPF ? facOPF.replace('-', ' N° ') : 'No detectada / no aplica'}`);
-  console.log(`  • En Retención: ${facRet ? facRet.replace('-', ' N° ') : (tieneRetencion ? 'NO DETECTADA (ERROR)' : 'No aplica')}`);
+  console.log(`  • En Retención: ${facRet ? facRet.replace('-', ' N° ') : (tieneRetencion ? 'Comprobante presente (sin factura legible)' : 'No aplica')}`);
 
   if (!facFisica) {
     console.warn(`[ERROR FACTURA] No se pudo leer el número en la Factura física.`);
@@ -576,20 +593,29 @@ async function procesarSubcarpetaExpediente(carpetaExpediente, carpetaFecha, map
   }
 
   if (tieneRetencion) {
+    const textoRet = normalizarTexto(retencionDoc.textoCompleto || '');
+    const esRetencionCero = textoRet.includes('$ 0,00') ||
+                            textoRet.includes('$0,00') ||
+                            textoRet.includes('BASE IMPONIBLE: 0') ||
+                            textoRet.includes('EXENTO') ||
+                            textoRet.includes('NO SUJETO');
+
     if (!facRet) {
-      console.warn(`[ERROR FACTURA] Se encontró retención (${retencionDoc.nombreArchivo}) pero no se pudo extraer el número de factura.`);
-      validacionCorrecta = false;
-    } else if (facRet !== facFisica) {
+      console.warn(`[AVISO RETENCIÓN] Retención (${retencionDoc.nombreArchivo}) presente sin número de factura explícito. Se mantiene en compaginación.`);
+    } else if (facFisica && facRet !== facFisica) {
       console.warn(`[ERROR FACTURA] Discrepancia: Física (${facFisica}) vs Retención (${facRet})`);
       validacionCorrecta = false;
+    } else {
+      if (esRetencionCero) {
+        console.log(`[OK RETENCIÓN] Retención con importe $0 / Exenta (Cooperativa o exento) validada y retenida.`);
+      } else {
+        console.log(`[OK RETENCIÓN] Retención validada contra factura: ${facRet.replace('-', ' N° ')}`);
+      }
     }
   }
 
-  if (validacionCorrecta && facFisica && (!tieneRetencion || facRet === facFisica)) {
-    console.log(`[OK] Factura validada en todos los comprobantes: ${facFisica.replace('-', ' N° ')}`);
-  }
-
   console.log('\n=== COMPAGINANDO ARCHIVOS ===');
+  // Ordenar de menor a mayor según la matriz de prioridades
   documentos.sort((a, b) => a.prioridad - b.prioridad);
   const pdfFinal = await PDFDocument.create();
 
@@ -655,7 +681,6 @@ async function procesarSubcarpetaExpediente(carpetaExpediente, carpetaFecha, map
         }
 
       } else {
-        // Documentos simples o fojas individuales
         for (let p = 1; p <= totalPaginas; p++) {
           const textoPagina = await extraerTextoPaginaIndividual(doc.rutaCompleta, p);
           const filtroDescarte = esHojaDescartable(textoPagina, doc.tipoDetectado === 'FACTURA');

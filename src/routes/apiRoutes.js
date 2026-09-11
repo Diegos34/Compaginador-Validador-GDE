@@ -1,331 +1,172 @@
 const express = require('express');
+const router = express.Router();
 const multer = require('multer');
-const fs = require('fs/promises');
 const path = require('path');
-const { spawn } = require('child_process');
+const fs = require('fs/promises');
+const xlsx = require('xlsx');
 
 const {
   RUTA_ENTRADA_BASE,
   RUTA_SALIDA_BASE,
-  RUTA_TEMP,
-  RUTA_BUZON,
-  ARCHIVO_EXCEL_DEFAULT,
-  ARCHIVO_OBSERVACIONES
+  ARCHIVO_EXCEL_DEFAULT
 } = require('../config/paths');
-const { abrirEnExplorador } = require('../services/explorerService');
-const { guardarObservacion, vaciarExpedientes } = require('../services/dbService');
-const {
-  obtenerEstadoExpedientes,
-  obtenerODefinirCarpetaDestino,
-  limpiarCacheEstado
-} = require('../services/excelService');
-const {
-  getExpedienteActivo,
-  setExpedienteActivo,
-  vaciarBuzonHaciaExpediente
-} = require('../services/buzonService');
-const {
-  agregarCliente,
-  removerCliente,
-  emitirEvento
-} = require('../services/sseService');
 
-const router = express.Router();
-const upload = multer({ storage: multer.memoryStorage() });
+const dbService = require('../services/dbService');
+const { ejecutarDescargaAutomatica, detenerScraper } = require('../services/scraperService');
 
-let enProceso = false;
-let ultimosLogs = '';
-let procesoActivoChild = null;
+// Configuración de multer para subida del archivo Excel
+const upload = multer({ dest: path.resolve('./temp') });
 
-function emitirLog(linea) {
-  ultimosLogs += linea;
-  emitirEvento('log', { log: linea, enProceso });
+// Gestión de clientes SSE (Server-Sent Events)
+let clientesSSE = [];
+
+function emitirLog(mensaje) {
+  console.log(mensaje);
+  const data = JSON.stringify({ tipo: 'log', texto: mensaje });
+  clientesSSE.forEach(res => res.write(`data: ${data}\n\n`));
 }
 
-function notificarCambioEstado() {
-  limpiarCacheEstado();
-  obtenerEstadoExpedientes(true).then(data => {
-    emitirEvento('estado', {
-      ...data,
-      enProceso,
-      expedienteActivoBuzon: getExpedienteActivo()
-    });
-  }).catch(() => {});
+function notificarCambioEstado(payload = { tipo: 'actualizar' }) {
+  const data = JSON.stringify(payload);
+  clientesSSE.forEach(res => res.write(`data: ${data}\n\n`));
 }
 
-// Canal SSE
-router.get('/stream', (req, res) => {
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive'
+function normalizarFechaExcel(val) {
+  if (!val) return null;
+  const d = new Date(val);
+  if (!isNaN(d.getTime())) {
+    const dia = String(d.getDate()).padStart(2, '0');
+    const mes = String(d.getMonth() + 1).padStart(2, '0');
+    const anio = d.getFullYear();
+    return `${dia}-${mes}-${anio}`;
+  }
+  return String(val).trim();
+}
+
+// Endpoint SSE para terminal en vivo
+router.get('/eventos', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+
+  clientesSSE.push(res);
+
+  req.on('close', () => {
+    clientesSSE = clientesSSE.filter(c => c !== res);
   });
-
-  agregarCliente(res);
-
-  obtenerEstadoExpedientes().then(data => {
-    res.write(`event: init\ndata: ${JSON.stringify({
-      ...data,
-      enProceso,
-      logs: ultimosLogs,
-      expedienteActivoBuzon: getExpedienteActivo()
-    })}\n\n`);
-  }).catch(() => {});
-
-  req.on('close', () => removerCliente(res));
 });
 
+// Obtener lista completa de expedientes con cálculo de estado en disco
 router.get('/expedientes', async (req, res) => {
   try {
-    const data = await obtenerEstadoExpedientes(true);
-    res.json({
-      ...data,
-      enProceso,
-      logs: ultimosLogs,
-      expedienteActivoBuzon: getExpedienteActivo()
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message, expedientes: [] });
-  }
-});
+    const expedientes = dbService.obtenerTodosLosExpedientes();
+    const resultado = [];
 
-router.post('/activar-escucha', (req, res) => {
-  try {
-    const activo = setExpedienteActivo(req.body);
-    if (activo) {
-      setTimeout(() => {
-        vaciarBuzonHaciaExpediente(emitirLog, notificarCambioEstado);
-      }, 200);
-    }
-    emitirEvento('buzon', { expedienteActivoBuzon: activo });
-    res.json({ ok: true, expedienteActivoBuzon: activo });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
+    const carpetasSalida = await fs.readdir(RUTA_SALIDA_BASE).catch(() => []);
+    const carpetasEntrada = await fs.readdir(RUTA_ENTRADA_BASE).catch(() => []);
 
-router.post('/abrir-carpeta', async (req, res) => {
-  try {
-    const { fecha, expediente } = req.body;
-    let destinoFinal = null;
-    const fechaCarpeta = (fecha || '').replace(/[/\\?%*:|"<>]/g, '-');
-    const rutaFecha = path.join(RUTA_ENTRADA_BASE, fechaCarpeta);
+    for (const exp of expedientes) {
+      let estado = 'Pendiente';
 
-    try {
-      const existentes = await fs.readdir(rutaFecha);
-      const sub = existentes.find(dir => dir.includes(expediente));
-      if (sub) destinoFinal = path.join(rutaFecha, sub);
-    } catch (_) {}
-
-    if (!destinoFinal) {
-      try {
-        const fechas = await fs.readdir(RUTA_ENTRADA_BASE);
-        for (const f of fechas) {
-          const rF = path.join(RUTA_ENTRADA_BASE, f);
-          const st = await fs.stat(rF).catch(() => null);
+      if (exp.tiene_error_manual) {
+        estado = 'Con Problema';
+      } else {
+        let existeEnSalida = false;
+        for (const fDir of carpetasSalida) {
+          const rutaF = path.join(RUTA_SALIDA_BASE, fDir);
+          const st = await fs.stat(rutaF).catch(() => null);
           if (st && st.isDirectory()) {
-            const subs = await fs.readdir(rF);
-            const match = subs.find(d => d.includes(expediente));
-            if (match) {
-              destinoFinal = path.join(rF, match);
+            const archivos = await fs.readdir(rutaF);
+            if (archivos.some(a => a.toLowerCase().endsWith('.pdf') && (a.startsWith(`${exp.id} `) || a.includes(exp.expediente)))) {
+              existeEnSalida = true;
               break;
             }
           }
         }
-      } catch (_) {}
-    }
 
-    if (!destinoFinal) {
-      return res.status(404).json({ error: 'No se encontró la carpeta en el disco' });
-    }
-
-    abrirEnExplorador(destinoFinal);
-    res.json({ ok: true, ruta: destinoFinal });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.post('/abrir-archivo-salida', async (req, res) => {
-  try {
-    const { expediente } = req.body;
-    let rutaPdf = null;
-
-    const fechasSalida = await fs.readdir(RUTA_SALIDA_BASE).catch(() => []);
-    for (const f of fechasSalida) {
-      const rF = path.join(RUTA_SALIDA_BASE, f);
-      const st = await fs.stat(rF).catch(() => null);
-      if (st && st.isDirectory()) {
-        const archivos = await fs.readdir(rF);
-        const match = archivos.find(a => a.includes(expediente) && a.toLowerCase().endsWith('.pdf'));
-        if (match) {
-          rutaPdf = path.join(rF, match);
-          break;
-        }
-      }
-    }
-
-    if (!rutaPdf) {
-      return res.status(404).json({ error: 'No se encontró el PDF de salida generado.' });
-    }
-
-    abrirEnExplorador(rutaPdf);
-    res.json({ ok: true, ruta: rutaPdf });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.post('/abrir-carpeta-salida', async (req, res) => {
-  try {
-    const { fecha, expediente } = req.body;
-    let carpetaFinal = null;
-
-    const fechasSalida = await fs.readdir(RUTA_SALIDA_BASE).catch(() => []);
-    for (const f of fechasSalida) {
-      const rF = path.join(RUTA_SALIDA_BASE, f);
-      const st = await fs.stat(rF).catch(() => null);
-      if (st && st.isDirectory()) {
-        const archivos = await fs.readdir(rF);
-        const match = archivos.find(a => a.includes(expediente) && a.toLowerCase().endsWith('.pdf'));
-        if (match) {
-          carpetaFinal = rF;
-          break;
-        }
-      }
-    }
-
-    if (!carpetaFinal && fecha) {
-      const fechaLimpia = fecha.replace(/[/\\?%*:|"<>]/g, '-');
-      const posibleRuta = path.join(RUTA_SALIDA_BASE, fechaLimpia);
-      const stFecha = await fs.stat(posibleRuta).catch(() => null);
-      if (stFecha && stFecha.isDirectory()) {
-        carpetaFinal = posibleRuta;
-      }
-    }
-
-    if (!carpetaFinal) {
-      carpetaFinal = RUTA_SALIDA_BASE;
-    }
-
-    abrirEnExplorador(carpetaFinal);
-    res.json({ ok: true, ruta: carpetaFinal });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.post('/limpiar-salida-expediente', async (req, res) => {
-  try {
-    const { expediente } = req.body;
-    let borrado = false;
-
-    const fechasSalida = await fs.readdir(RUTA_SALIDA_BASE).catch(() => []);
-    for (const f of fechasSalida) {
-      const rF = path.join(RUTA_SALIDA_BASE, f);
-      const st = await fs.stat(rF).catch(() => null);
-      if (st && st.isDirectory()) {
-        const archivos = await fs.readdir(rF);
-        const match = archivos.find(a => a.includes(expediente) && a.toLowerCase().endsWith('.pdf'));
-        if (match) {
-          await fs.unlink(path.join(rF, match)).catch(() => {});
-          borrado = true;
-          break;
-        }
-      }
-    }
-
-    notificarCambioEstado();
-    res.json({ ok: true, borrado });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-router.post('/limpiar-carpeta-expediente', async (req, res) => {
-  try {
-    const { fecha, expediente } = req.body;
-    let rutaSub = null;
-
-    const fechaCarpeta = (fecha || '').replace(/[/\\?%*:|"<>]/g, '-');
-    const rutaFecha = path.join(RUTA_ENTRADA_BASE, fechaCarpeta);
-
-    try {
-      const existentes = await fs.readdir(rutaFecha);
-      const sub = existentes.find(dir => dir.includes(expediente));
-      if (sub) rutaSub = path.join(rutaFecha, sub);
-    } catch (_) {}
-
-    if (!rutaSub) {
-      try {
-        const fechas = await fs.readdir(RUTA_ENTRADA_BASE);
-        for (const f of fechas) {
-          const rF = path.join(RUTA_ENTRADA_BASE, f);
-          const st = await fs.stat(rF).catch(() => null);
-          if (st && st.isDirectory()) {
-            const subs = await fs.readdir(rF);
-            const match = subs.find(d => d.includes(expediente));
-            if (match) {
-              rutaSub = path.join(rF, match);
-              break;
+        if (existeEnSalida) {
+          estado = 'Completado';
+        } else {
+          let existeEnEntrada = false;
+          for (const fDir of carpetasEntrada) {
+            const rutaF = path.join(RUTA_ENTRADA_BASE, fDir);
+            const st = await fs.stat(rutaF).catch(() => null);
+            if (st && st.isDirectory()) {
+              const subdirs = await fs.readdir(rutaF);
+              const coincidente = subdirs.find(s => s.includes(exp.expediente) || s.startsWith(`${exp.id} `));
+              if (coincidente) {
+                const archivosEntrada = await fs.readdir(path.join(rutaF, coincidente));
+                if (archivosEntrada.some(a => a.toLowerCase().endsWith('.pdf'))) {
+                  existeEnEntrada = true;
+                  break;
+                }
+              }
             }
           }
+
+          if (existeEnEntrada) {
+            estado = 'Listo (Con PDFs)';
+          }
         }
-      } catch (_) {}
-    }
-
-    if (!rutaSub) {
-      return res.status(404).json({ error: 'No existe la carpeta para este expediente' });
-    }
-
-    const archivos = await fs.readdir(rutaSub);
-    let accionRealizada = '';
-
-    if (archivos.length > 0) {
-      for (const arch of archivos) {
-        await fs.unlink(path.join(rutaSub, arch)).catch(() => {});
       }
-      accionRealizada = 'vaciada';
-    } else {
-      await fs.rm(rutaSub, { recursive: true, force: true }).catch(() => {});
-      accionRealizada = 'eliminada';
+
+      resultado.push({
+        ...exp,
+        estado
+      });
     }
 
-    notificarCambioEstado();
-    res.json({ ok: true, accion: accionRealizada });
+    res.json(resultado);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/subir-pdfs-expediente', upload.array('pdfs'), async (req, res) => {
+// Subir y parsear Excel
+router.post('/subir-excel', upload.single('archivo'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No se subió ningún archivo' });
+
   try {
-    const { fecha, id, nombre, expediente } = req.body;
-    const archivos = req.files;
+    await fs.copyFile(req.file.path, ARCHIVO_EXCEL_DEFAULT);
+    await fs.unlink(req.file.path).catch(() => {});
 
-    if (!expediente || !archivos || archivos.length === 0) {
-      return res.status(400).json({ error: 'Datos incompletos o sin archivos.' });
+    const wb = xlsx.readFile(ARCHIVO_EXCEL_DEFAULT, { cellDates: true });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    const filas = xlsx.utils.sheet_to_json(sheet, { header: 1 });
+
+    const lote = [];
+    for (const fila of filas) {
+      const id = fila[2] ? String(fila[2]).trim() : '';
+      const nombre = fila[3] ? String(fila[3]).trim() : '';
+      const expRaw = fila[4] ? String(fila[4]).trim() : '';
+      const monto = fila[6] !== undefined && fila[6] !== null ? Number(fila[6]) : null;
+
+      if (expRaw && expRaw.includes('-')) {
+        const expLimpio = expRaw.replace(/\s+/g, '');
+        lote.push({
+          expediente: expLimpio,
+          id,
+          nombre,
+          fecha: normalizarFechaExcel(fila[0]),
+          monto
+        });
+      }
     }
 
-    const carpetaDestino = await obtenerODefinirCarpetaDestino(fecha, id, nombre, expediente);
-    for (const arch of archivos) {
-      await fs.writeFile(path.join(carpetaDestino, arch.originalname), arch.buffer);
-    }
-
+    dbService.insertarOActualizarLote(lote);
+    emitirLog(`[EXCEL] Planilla importada exitosamente: ${lote.length} registros cargados.`);
     notificarCambioEstado();
-    res.json({ ok: true, guardados: archivos.length });
+    res.json({ ok: true, cantidad: lote.length });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-router.post('/upload-excel', upload.single('excel'), async (req, res) => {
+// Guardar observación o flag de error manual
+router.post('/guardar-observacion', (req, res) => {
+  const { expediente, observacion, tiene_error_manual } = req.body;
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No se encontró archivo' });
-    }
-
-    await fs.writeFile(ARCHIVO_EXCEL_DEFAULT, req.file.buffer);
+    dbService.guardarObservacion(expediente, observacion, tiene_error_manual);
     notificarCambioEstado();
     res.json({ ok: true });
   } catch (err) {
@@ -333,10 +174,11 @@ router.post('/upload-excel', upload.single('excel'), async (req, res) => {
   }
 });
 
-router.post('/guardar-observacion', async (req, res) => {
+// Resetear base de datos completa
+router.post('/resetear', (req, res) => {
   try {
-    const { expediente, observacion, tieneErrorManual } = req.body;
-    await guardarObservacion(expediente, observacion, tieneErrorManual);
+    dbService.vaciarExpedientes();
+    emitirLog('[RESET] Base de datos vaciada y reiniciada.');
     notificarCambioEstado();
     res.json({ ok: true });
   } catch (err) {
@@ -344,96 +186,22 @@ router.post('/guardar-observacion', async (req, res) => {
   }
 });
 
-router.post('/reset-todo', async (req, res) => {
-  if (enProceso) {
-    return res.status(409).json({ error: 'No se puede resetear mientras hay un lote en ejecución.' });
-  }
+// Iniciar Scraper / Bot de GDE a demanda
+router.post('/iniciar-scraper', (req, res) => {
+  res.json({ ok: true, mensaje: 'Descarga de GDE iniciada en segundo plano.' });
 
-  try {
-    await fs.rm(RUTA_ENTRADA_BASE, { recursive: true, force: true });
-    await fs.mkdir(RUTA_ENTRADA_BASE, { recursive: true });
-
-    await fs.rm(RUTA_SALIDA_BASE, { recursive: true, force: true });
-    await fs.mkdir(RUTA_SALIDA_BASE, { recursive: true });
-
-    await fs.rm(RUTA_TEMP, { recursive: true, force: true });
-    await fs.mkdir(RUTA_TEMP, { recursive: true });
-
-    await fs.rm(RUTA_BUZON, { recursive: true, force: true });
-    await fs.mkdir(RUTA_BUZON, { recursive: true });
-
-    await fs.unlink(ARCHIVO_EXCEL_DEFAULT).catch(() => {});
-    await fs.unlink(ARCHIVO_OBSERVACIONES).catch(() => {});
-
-    setExpedienteActivo(null);
-    ultimosLogs = `[${new Date().toLocaleTimeString()}] Sistema reseteado a cero.\n`;
-
-    notificarCambioEstado();
-    emitirEvento('log', { log: ultimosLogs, reset: true });
-
-    res.json({ ok: true, mensaje: 'Sistema reseteado exitosamente.' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+  ejecutarDescargaAutomatica(
+    (log) => emitirLog(log),
+    (evt) => notificarCambioEstado(evt)
+  ).catch(err => {
+    emitirLog(`[RPA GDE] ❌ Error en el proceso: ${err.message}`);
+  });
 });
 
-router.post('/procesar', (req, res) => {
-  if (enProceso) {
-    return res.status(409).json({ error: 'Ya hay un lote en proceso.' });
-  }
-
-  enProceso = true;
-  emitirLog(`\n[${new Date().toLocaleTimeString()}] Iniciando lote...\n`);
-  emitirEvento('estado_proceso', { enProceso: true });
-
-  procesoActivoChild = spawn('node', ['procesar_lote.js']);
-
-  procesoActivoChild.stdout.on('data', d => {
-    emitirLog(d.toString());
-    process.stdout.write(d.toString());
-  });
-
-  procesoActivoChild.stderr.on('data', d => {
-    emitirLog(`[ERROR] ${d.toString()}`);
-    process.stderr.write(d.toString());
-  });
-
-  procesoActivoChild.on('error', err => {
-    enProceso = false;
-    procesoActivoChild = null;
-    emitirLog(`\n[ERROR FATAL]: ${err.message}\n`);
-    emitirEvento('estado_proceso', { enProceso: false });
-    notificarCambioEstado();
-  });
-
-  procesoActivoChild.on('close', (code, signal) => {
-    enProceso = false;
-    procesoActivoChild = null;
-
-    if (signal === 'SIGTERM' || signal === 'SIGINT') {
-      emitirLog(`\n[CANCELADO]: Lote detenido manualmente por el usuario.\n`);
-    } else {
-      emitirLog(`\n[${new Date().toLocaleTimeString()}] Lote finalizado (Código: ${code})\n`);
-    }
-
-    emitirEvento('estado_proceso', { enProceso: false });
-    notificarCambioEstado();
-  });
-
-  res.json({ ok: true });
-});
-
-router.post('/cancelar-proceso', (req, res) => {
-  if (!enProceso || !procesoActivoChild) {
-    return res.status(400).json({ error: 'No hay ningún lote en ejecución.' });
-  }
-
-  try {
-    procesoActivoChild.kill('SIGTERM');
-    res.json({ ok: true, mensaje: 'Señal de detención enviada.' });
-  } catch (err) {
-    res.status(500).json({ error: `Error deteniendo el proceso: ${err.message}` });
-  }
+// Detener Scraper / Bot de GDE
+router.post('/detener-scraper', (req, res) => {
+  const detenido = detenerScraper(emitirLog);
+  res.json({ ok: true, detenido });
 });
 
 module.exports = {
