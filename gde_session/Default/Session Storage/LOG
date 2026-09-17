@@ -1,3 +1,2 @@
-2026/09/11-00:42:02.028 8a36 Reusing MANIFEST /home/diegos/validador-gde/gde_session/Default/Session Storage/MANIFEST-000001
-2026/09/11-00:42:02.031 8a36 Recovering log #3
-2026/09/11-00:42:02.032 8a36 Reusing old log /home/diegos/validador-gde/gde_session/Default/Session Storage/000003.log 
+2026/09/14-11:00:42.870 8c81 Creating DB /home/diegos/validador-gde/gde_session/Default/Session Storage since it was missing.
+2026/09/14-11:00:42.887 8c81 Reusing MANIFEST /home/diegos/validador-gde/gde_session/Default/Session Storage/MANIFEST-000001

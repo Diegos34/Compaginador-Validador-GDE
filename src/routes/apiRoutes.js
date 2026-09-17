@@ -14,10 +14,7 @@ const {
 const dbService = require('../services/dbService');
 const { ejecutarDescargaAutomatica, detenerScraper } = require('../services/scraperService');
 
-// Configuración de multer para subida del archivo Excel
 const upload = multer({ dest: path.resolve('./temp') });
-
-// Gestión de clientes SSE (Server-Sent Events)
 let clientesSSE = [];
 
 function emitirLog(mensaje) {
@@ -43,7 +40,6 @@ function normalizarFechaExcel(val) {
   return String(val).trim();
 }
 
-// Endpoint SSE para terminal en vivo
 router.get('/eventos', (req, res) => {
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
@@ -56,7 +52,6 @@ router.get('/eventos', (req, res) => {
   });
 });
 
-// Obtener lista completa de expedientes con cálculo de estado en disco
 router.get('/expedientes', async (req, res) => {
   try {
     const expedientes = dbService.obtenerTodosLosExpedientes();
@@ -122,7 +117,6 @@ router.get('/expedientes', async (req, res) => {
   }
 });
 
-// Subir y parsear Excel
 router.post('/subir-excel', upload.single('archivo'), async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No se subió ningún archivo' });
 
@@ -162,7 +156,6 @@ router.post('/subir-excel', upload.single('archivo'), async (req, res) => {
   }
 });
 
-// Guardar observación o flag de error manual
 router.post('/guardar-observacion', (req, res) => {
   const { expediente, observacion, tiene_error_manual } = req.body;
   try {
@@ -174,7 +167,17 @@ router.post('/guardar-observacion', (req, res) => {
   }
 });
 
-// Resetear base de datos completa
+router.post('/revertir-activo', (req, res) => {
+  const { expediente } = req.body;
+  try {
+    dbService.revertirAActivo(expediente);
+    notificarCambioEstado();
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 router.post('/resetear', (req, res) => {
   try {
     dbService.vaciarExpedientes();
@@ -186,7 +189,6 @@ router.post('/resetear', (req, res) => {
   }
 });
 
-// Iniciar Scraper / Bot de GDE a demanda
 router.post('/iniciar-scraper', (req, res) => {
   res.json({ ok: true, mensaje: 'Descarga de GDE iniciada en segundo plano.' });
 
@@ -198,7 +200,6 @@ router.post('/iniciar-scraper', (req, res) => {
   });
 });
 
-// Detener Scraper / Bot de GDE
 router.post('/detener-scraper', (req, res) => {
   const detenido = detenerScraper(emitirLog);
   res.json({ ok: true, detenido });

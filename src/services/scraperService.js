@@ -1,304 +1,465 @@
+const { chromium } = require('playwright');
 const path = require('path');
 const fs = require('fs/promises');
-const { chromium } = require('playwright');
-const { RUTA_ENTRADA_BASE, RUTA_SALIDA_BASE } = require('../config/paths');
-const { obtenerTodosLosExpedientes, guardarObservacion } = require('./dbService');
+const { RUTA_ENTRADA_BASE } = require('../config/paths');
+const dbService = require('./dbService');
+const { clasificarYValidarPdf, evaluarChecklist } = require('./pdfClassifier');
 
-const URL_EE_PANEL = 'https://eue-termasderiohondo.gde.gob.ar/expedientes-web/panelUsuario.zul';
-const RUTA_SESION = path.resolve('./gde_session');
-
-let procesoEnEjecucion = false;
+const RUTA_SESION = path.resolve(__dirname, '../../temp_session');
+const CARPETA_TEMP_DESCARGAS = path.resolve(__dirname, '../../temp_downloads');
 let abortarScraper = false;
-let contextoNavegadorActivo = null;
 
-function detenerScraper(emitirLog = console.log) {
-  if (!procesoEnEjecucion) return false;
+function detenerScraper(emitirLog) {
   abortarScraper = true;
-  emitirLog('[RPA GDE] 🛑 Solicitud de detención recibida. Cerrando navegador...');
-  if (contextoNavegadorActivo) {
-    contextoNavegadorActivo.close().catch(() => {});
-  }
+  if (typeof emitirLog === 'function') emitirLog('[RPA GDE] ⛔ Solicitud de detención recibida.');
   return true;
 }
 
-function formatearExpedienteCompleto(expBase, reparticion = 'MEE#SEH') {
-  const limpio = expBase.trim().replace(/^EX-/, '').replace(/-\s*-TRHONDO.*$/, '');
-  return `EX-${limpio}- -TRHONDO-${reparticion}`;
+function formatearFechaCarpeta(fechaCruda) {
+  if (!fechaCruda) return 'SIN_FECHA';
+
+  const str = String(fechaCruda).trim();
+
+  // Si la fecha viene de la BD como "2025-12-02" (AAAA-MM-DD)
+  const m2 = str.match(/^(\d{4})[-/](\d{2})[-/](\d{2})/);
+  if (m2) {
+    // m2[1]=Año, m2[2]=Mes, m2[3]=Día
+    // Invertimos para forzar la salida a "02-12-2025"
+    return `${m2[2]}-${m2[3]}-${m2[1]}`;
+  }
+
+  // Si la fecha ya viene en la tabla como "12-02-2025"
+  const m1 = str.match(/^(\d{2})[-/](\d{2})[-/](\d{4})/);
+  if (m1) {
+    // m1[1]=Primer par, m1[2]=Segundo par, m1[3]=Año
+    // Cruzamos las posiciones de los dos primeros pares
+    return `${m1[2]}-${m1[1]}-${m1[3]}`;
+  }
+
+  // Parseo genérico (fallback)
+  const parseada = new Date(str);
+  if (!isNaN(parseada.getTime())) {
+    const d = String(parseada.getUTCDate()).padStart(2, '0');
+    const m = String(parseada.getUTCMonth() + 1).padStart(2, '0');
+    const y = parseada.getUTCFullYear();
+    // Forzamos el mismo cruce aquí
+    return `${m}-${d}-${y}`;
+  }
+
+  return 'SIN_FECHA';
+}
+
+function formatearNumeroSADE(expedienteRaw) {
+  if (!expedienteRaw) return '';
+  const str = String(expedienteRaw).trim();
+  if (str.startsWith('EX-') && str.includes('TRHONDO')) return str;
+  const match = str.match(/(\d{4})\s*[-/]\s*(\d+)/);
+  if (match) {
+    const anio = match[1];
+    const numeroPadded = match[2].padStart(8, '0');
+    return `EX-${anio}-${numeroPadded}- -TRHONDO-MEE#SEH`;
+  }
+  return str;
+}
+
+function esDocumentoRelevante(textoFila) {
+  const patron = /docfi|orden\s+de\s+pago|opf|comprobante|transferencia|banco|f\.?2004|suss|sicore|retenci[oó]n|rentas|iibb|factura|decreto|contrato|recepci[oó]n|reparo/i;
+  return patron.test(textoFila);
 }
 
 async function inicializarNavegador(headless = false) {
   await fs.mkdir(RUTA_SESION, { recursive: true });
+  await fs.mkdir(CARPETA_TEMP_DESCARGAS, { recursive: true });
+
   const context = await chromium.launchPersistentContext(RUTA_SESION, {
     headless,
-    viewport: { width: 1366, height: 768 },
+    viewport: null,
     acceptDownloads: true,
-    args: ['--start-maximized']
+    downloadsPath: CARPETA_TEMP_DESCARGAS,
+    args: [
+      '--start-maximized',
+      '--disable-dev-shm-usage',
+      '--no-sandbox',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--js-flags=--max-old-space-size=4096'
+    ]
   });
 
   const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
   return { context, page };
 }
 
-async function asegurarSesionActiva(page, emitirLog) {
-  await page.goto('https://eu-termasderiohondo.gde.gob.ar/eu-web/', { waitUntil: 'domcontentloaded' });
-  await page.waitForTimeout(2000);
+async function procesarYGuardarBuffer(buffer, expData, carpetaDestino, nombreSugerido, hashesGuardados, docsRegistrados, emitirLog, notificarCambio) {
+  if (!buffer || buffer.length < 1500) return false;
 
-  if (page.url().includes('/acceso/login')) {
-    emitirLog('[RPA GDE] ⚠️ Sesión no iniciada. Por favor iniciá sesión en la ventana del navegador...');
-    await page.waitForURL('**/eu-web/**', { timeout: 180000 });
-    emitirLog('[RPA GDE] ✅ Inicio de sesión detectado y guardado.');
+  const resultado = await clasificarYValidarPdf(buffer, expData);
+  if (!resultado.valido) return false;
+
+  if (hashesGuardados.has(resultado.sha)) {
+    emitirLog(`    ℹ Duplicado omitido [${resultado.tipo}]: archivo idéntico ya guardado.`);
+    return false;
   }
 
-  if (!page.url().includes('expedientes-web')) {
-    emitirLog('[RPA GDE] Accediendo al módulo de Expediente Electrónico (EE)...');
-    await page.goto(URL_EE_PANEL, { waitUntil: 'domcontentloaded' }).catch(() => {});
-    await page.waitForTimeout(3000);
+  hashesGuardados.add(resultado.sha);
+  docsRegistrados.push({ tipo: resultado.tipo, sha: resultado.sha, fechaDoc: resultado.fechaDoc });
+
+  const nombreLimpio = `${resultado.tipo}_${nombreSugerido}.pdf`.replace(/[/\\?%*:|"<>]/g, '_');
+  const rutaFinal = path.join(carpetaDestino, nombreLimpio);
+
+  await fs.writeFile(rutaFinal, buffer);
+  emitirLog(`    ✔ [${resultado.tipo}] Guardado (${Math.round(buffer.length / 1024)} KB): ${nombreLimpio}`);
+
+  if (typeof notificarCambio === 'function') notificarCambio();
+  return true;
+}
+
+async function salirDelVisor(page, emitirLog) {
+  if (page.isClosed()) return;
+  try {
+    emitirLog('    🔙 Recargando página de Consultas para salir de forma segura...');
+    await page.goto('https://eue-termasderiohondo.gde.gob.ar/expedientes-web/panelUsuario.zul', { waitUntil: 'domcontentloaded', timeout: 15000 });
+    await page.waitForTimeout(2000);
+
+    const tabConsultas = page.locator('.z-tab:has-text("Consultas")').first();
+    if (await tabConsultas.isVisible().catch(() => false)) {
+        await tabConsultas.click({ force: true });
+        await page.waitForTimeout(1000);
+    }
+  } catch (error) {
+    if (emitirLog) emitirLog(`    ⚠️ Error al recargar página: ${error.message}`);
   }
 }
 
-async function yaFueProcesado(expData) {
-  const { expediente, id } = expData;
+async function procesarModalAbierto(page, expData, carpetaDestino, prefijoFila, hashesGuardados, docsRegistrados, emitirLog, notificarCambio, promesaPdf) {
+  let bufferCapturado = null;
+
   try {
-    const carpetasSalida = await fs.readdir(RUTA_SALIDA_BASE).catch(() => []);
-    for (const fDir of carpetasSalida) {
-      const rutaFecha = path.join(RUTA_SALIDA_BASE, fDir);
-      const st = await fs.stat(rutaFecha).catch(() => null);
-      if (st && st.isDirectory()) {
-        const archivos = await fs.readdir(rutaFecha);
-        if (archivos.some(a => a.toLowerCase().endsWith('.pdf') && (a.startsWith(`${id} `) || a.includes(expediente)))) {
-          return true;
+    if (page.isClosed()) return;
+    emitirLog('    ⏳ Esperando recepción del stream PDF desde la red...');
+
+    if (promesaPdf) {
+      bufferCapturado = await promesaPdf;
+      if (bufferCapturado) {
+        emitirLog(`    ✔ PDF capturado desde red (${Math.round(bufferCapturado.length / 1024)} KB)`);
+
+        // --- INICIO INYECCIÓN DEBUG: GUARDADO FORZOSO ---
+        try {
+          const debugPath = path.join(carpetaDestino, `DEBUG_${prefijoFila}.pdf`.replace(/[/\\?%*:|"<>]/g, '_'));
+          await fs.writeFile(debugPath, bufferCapturado);
+          emitirLog(`    🛠️ [DEBUG] Archivo crudo forzado en disco: DEBUG_${prefijoFila}.pdf`);
+        } catch (e) {
+          emitirLog(`    ⚠️ [DEBUG] Error al forzar guardado en disco: ${e.message}`);
         }
+        // --- FIN INYECCIÓN DEBUG ---
+
+        // Dejamos que el flujo normal intente clasificarlo
+        await procesarYGuardarBuffer(bufferCapturado, expData, carpetaDestino, prefijoFila, hashesGuardados, docsRegistrados, emitirLog, notificarCambio);
       }
     }
-  } catch (_) {}
-  return false;
+
+    if (!bufferCapturado) {
+      emitirLog('    ⚠️ No se pudo capturar el archivo PDF por red.');
+    }
+
+  } finally {
+    if (!page.isClosed() && !abortarScraper) {
+        await salirDelVisor(page, emitirLog);
+    }
+  }
 }
 
-async function descargarAdjuntosDeFila(page, carpetaDestino, emitirLog) {
-  const modalVisor = page.locator('.z-window-modal, [class*="window"]').filter({ hasText: 'Visualizar Documento' });
-  await modalVisor.waitFor({ state: 'visible', timeout: 8000 }).catch(() => null);
+async function procesarExpedienteScraper(page, expedienteRow, carpetaBaseEntrada, emitirLog, notificarCambio) {
+  const expNumero = expedienteRow.expediente;
+  const codigoSADEOficial = formatearNumeroSADE(expNumero);
+  const matchNum = expNumero.match(/(\d{4})\s*[-/]\s*(\d+)/);
+  const anio = matchNum ? matchNum[1] : '2025';
+  const soloNumero = matchNum ? matchNum[2] : expNumero;
+  const numeroConCeros = soloNumero.padStart(8, '0');
 
-  if (!(await modalVisor.isVisible())) return;
+  emitirLog(`\n[RPA GDE] Procesando: ID ${expedienteRow.id} | ${expedienteRow.beneficiario} | Exp: ${expNumero}`);
+  emitirLog(`  • Buscando: ${codigoSADEOficial}`);
 
-  const btnDescargarDoc = modalVisor.locator('button, a, span').filter({ hasText: 'Descargar Documento' });
-  if (await btnDescargarDoc.count() > 0) {
-    try {
-      const [download] = await Promise.all([
-        page.waitForEvent('download', { timeout: 7000 }),
-        btnDescargarDoc.first().click()
-      ]);
-      const sugerido = download.suggestedFilename();
-      const rutaDest = path.join(carpetaDestino, sugerido);
-      await download.saveAs(rutaDest);
-      emitirLog(`    📥 Documento principal descargado: ${sugerido}`);
-    } catch (_) {}
-  }
+  // Extrae la fecha que viene de la tabla de tu sitio web
+  const fechaFila = expedienteRow.fecha_orden || expedienteRow.fecha;
+  const fechaCarpeta = formatearFechaCarpeta(fechaFila);
 
-  const filasTrabajo = modalVisor.locator('tr').filter({ hasText: 'Visualizar' });
-  const totalTrabajo = await filasTrabajo.count();
+  // Arma la subcarpeta: ID + Nombre + Numero de expediente
+  const subcarpetaNombre = `${expedienteRow.id} ${expedienteRow.beneficiario} ${expedienteRow.expediente}`.replace(/[/\\?%*:|"<>]/g, '_');
 
-  for (let i = 0; i < totalTrabajo; i++) {
-    if (abortarScraper) return;
-    const fila = filasTrabajo.nth(i);
-    const linkVisualizar = fila.locator('a, span, button').filter({ hasText: 'Visualizar' });
+  // 👇 ESTA ES LA LÍNEA QUE FALTABA 👇
+  const carpetaDestino = path.join(carpetaBaseEntrada, fechaCarpeta, subcarpetaNombre);
 
-    if (await linkVisualizar.count() > 0) {
-      try {
-        const [download] = await Promise.all([
-          page.waitForEvent('download', { timeout: 7000 }),
-          linkVisualizar.first().click()
-        ]);
-        const nombreArchivo = download.suggestedFilename();
-        const rutaDest = path.join(carpetaDestino, nombreArchivo);
-        await download.saveAs(rutaDest);
-        emitirLog(`    📎 Adjunto descargado: ${nombreArchivo}`);
-      } catch (_) {}
-    }
-  }
-
-  await page.keyboard.press('Escape');
-  await page.waitForTimeout(500);
-}
-
-async function buscarExpedienteEnGde(page, expBase, emitirLog) {
-  const reparticiones = ['MEE#SEH', 'MEG#INT'];
-
-  const tabConsultas = page.locator('.z-tab, .z-tab-text').filter({ hasText: 'Consultas' }).first();
-  if (await tabConsultas.isVisible()) {
-    await tabConsultas.click();
-    await page.waitForTimeout(1000);
-  }
-
-  for (const rep of reparticiones) {
-    if (abortarScraper) return { encontrado: false };
-    const expedienteCompleto = formatearExpedienteCompleto(expBase, rep);
-    emitirLog(`  • Probando búsqueda: ${expedienteCompleto}`);
-
-    const inputBusqueda = page.locator('input[placeholder*="GDE"], input[title*="GDE"], .z-bandbox-input, .z-textbox').first();
-    await inputBusqueda.click({ clickCount: 3 });
-    await inputBusqueda.press('Backspace');
-    await page.waitForTimeout(150);
-
-    await inputBusqueda.fill(expedienteCompleto);
-    await page.waitForTimeout(250);
-
-    const btnLupa = page.locator('.z-bandbox-button, button:has(i.z-icon-search)').first();
-    if (await btnLupa.isVisible()) {
-      await btnLupa.click();
-    } else {
-      await inputBusqueda.press('Enter');
-    }
-
-    await page.waitForTimeout(3000);
-
-    const popupError = page.locator('.z-messagebox-window, .z-window-highlighted').filter({ hasText: /no existe|no se encontr/i });
-    if (await popupError.isVisible()) {
-      emitirLog(`    ✖ No encontrado con ${rep}. Probando alternativa...`);
-      const btnOk = popupError.locator('button').first();
-      if (await btnOk.isVisible()) await btnOk.click();
-      await page.waitForTimeout(800);
-      continue;
-    }
-
-    const filaExpediente = page.locator('tr.z-row, tr.z-listitem').filter({ hasText: expBase }).first();
-    if (await filaExpediente.isVisible()) {
-      emitirLog(`    ✔ Localizado con repartición: ${rep}`);
-      return { encontrado: true, fila: filaExpediente, expedienteCompleto };
-    }
-  }
-
-  return { encontrado: false };
-}
-
-async function procesarExpedienteScraper(page, expData, emitirLog, notificarCambioEstado) {
-  if (abortarScraper) return;
-  const { expediente, id, nombre, fecha } = expData;
-  emitirLog(`\n[RPA GDE] Iniciando: ID ${id} | ${nombre} | Exp: ${expediente}`);
-
-  const fechaLimpia = (fecha || 'SIN_FECHA').replace(/\//g, '-');
-  const nombreCarpeta = `${id} ${nombre} ${expediente}`.trim().replace(/[/\\?%*:|"<>]/g, ' ');
-  const carpetaDestino = path.join(RUTA_ENTRADA_BASE, fechaLimpia, nombreCarpeta);
-
-  const resultado = await buscarExpedienteEnGde(page, expediente, emitirLog);
-  if (abortarScraper) return;
-
-  if (!resultado.encontrado) {
-    guardarObservacion(expediente, 'No se encontró el expediente en MEE#SEH ni en MEG#INT', true);
-    if (notificarCambioEstado) notificarCambioEstado();
-    return;
-  }
-
-  const comboAcciones = resultado.fila.locator('.z-combobox-button, input[readonly]').last();
-  await comboAcciones.click();
-  await page.waitForTimeout(600);
-
-  const opcionVisualizar = page.locator('.z-combobox-popup .z-comboitem-text, .z-comboitem').filter({ hasText: 'Visualizar' }).first();
-  if (await opcionVisualizar.isVisible()) {
-    await opcionVisualizar.click();
-  } else {
-    await page.getByText('Visualizar', { exact: true }).last().click();
-  }
-
-  await page.waitForTimeout(2500);
-  if (abortarScraper) return;
-
+  // Si la carpeta de la fecha o del expediente no existen, las crea. Si existen, las conserva.
   await fs.mkdir(carpetaDestino, { recursive: true });
 
-  const tabSinPase = page.locator('.z-tab, .z-tab-text').filter({ hasText: 'Sin Pase' }).first();
-  if (await tabSinPase.isVisible()) {
-    await tabSinPase.click();
-    await page.waitForTimeout(1500);
+  const hashesGuardados = new Set();
+  const docsRegistrados = [];
+
+  await page.goto('https://eue-termasderiohondo.gde.gob.ar/expedientes-web/panelUsuario.zul', { waitUntil: 'domcontentloaded' });
+  await page.waitForTimeout(2000);
+
+  const tabConsultasInit = page.locator('.z-tab:has-text("Consultas")').first();
+  if (await tabConsultasInit.isVisible().catch(() => false)) {
+      await tabConsultasInit.click({ force: true });
+      await page.waitForTimeout(1000);
   }
 
-  const filasDoc = page.locator('tr.z-row, tr.z-listitem').filter({
-    hasText: /DOCFI|NO - Nota|Orden de Pago/i
-  });
-  const total = await filasDoc.count();
-  emitirLog(`  • Inspeccionando ${total} documentos en "Sin Pase"...`);
+  const inputBuscador = page.locator('input[placeholder*="número GDE" i], input[title*="número GDE" i], input.z-textbox').first();
+  await inputBuscador.waitFor({ state: 'visible', timeout: 10000 });
+  await inputBuscador.fill('');
+  await inputBuscador.fill(codigoSADEOficial);
 
-  for (let i = 0; i < total; i++) {
-    if (abortarScraper) return;
-    const fila = filasDoc.nth(i);
-    const btnLupa = fila.locator('[title*="Visualizar"], i.z-icon-search, .z-toolbarbutton').last();
+  const btnLupa = page.locator('button:has(i.z-icon-search), a:has(i.z-icon-search)').first();
+  if (await btnLupa.isVisible().catch(() => false)) {
+    await btnLupa.click({ force: true });
+  } else {
+    await page.keyboard.press('Enter');
+  }
 
-    if (await btnLupa.isVisible()) {
-      await btnLupa.click();
-      await page.waitForTimeout(1500);
-      await descargarAdjuntosDeFila(page, carpetaDestino, emitirLog);
+  emitirLog('  ⏳ Esperando grilla de resultados...');
+  await page.waitForLoadState('domcontentloaded');
+  await page.waitForTimeout(4000);
+
+  const filaExp = page.locator('tr.z-listitem, tr.z-row').filter({ hasText: numeroConCeros }).first();
+  await filaExp.waitFor({ state: 'visible', timeout: 10000 });
+  emitirLog('  ✔ Expediente encontrado. Abriendo menú de acciones...');
+
+  const combobox = filaExp.locator('.z-combobox').first();
+  await combobox.scrollIntoViewIfNeeded();
+
+  const btnFlecha = combobox.locator('.z-combobox-button, .z-combobox-btn, i.z-icon-caret-down').first();
+  if (await btnFlecha.isVisible().catch(() => false)) {
+    await btnFlecha.click();
+  } else {
+    const inputCombo = combobox.locator('input').first();
+    await inputCombo.click();
+    await page.keyboard.press('Alt+ArrowDown');
+  }
+
+  const itemVisualizar = page.locator('div.z-combobox-popup li.z-comboitem span.z-comboitem-text:text-is("Visualizar"), .z-comboitem-text:text-is("Visualizar")').first();
+  await itemVisualizar.waitFor({ state: 'visible', timeout: 6000 });
+  await itemVisualizar.click({ force: true });
+
+  emitirLog('  ⏳ Esperando carga de la vista del expediente...');
+  await page.waitForTimeout(4500);
+
+  const tabSinPase = page.locator('.z-tab:has-text("Sin Pase")').first();
+  if (await tabSinPase.isVisible({ timeout: 8000 }).catch(() => false)) {
+    await tabSinPase.click({ force: true });
+    emitirLog('  ✔ Pestaña "Sin Pase" seleccionada.');
+    await page.waitForTimeout(2000);
+  }
+
+  let hayPaginaDocSiguiente = true;
+  let numeroPaginaDoc = 1;
+
+  while (hayPaginaDocSiguiente && !page.isClosed()) {
+    const panelActivo = page.locator('.z-tabpanel:not([style*="display: none"])');
+    const filasDoc = panelActivo.locator('tr.z-listitem, tr.z-row');
+    const totalFilas = await filasDoc.count().catch(() => 0);
+    emitirLog(`  • Pág ${numeroPaginaDoc}: Analizando ${totalFilas} filas...`);
+
+    for (let i = 0; i < totalFilas; i++) {
+      if (abortarScraper || page.isClosed()) break;
+
+      const fila = filasDoc.nth(i);
+      const textoFila = await fila.innerText().catch(() => '');
+
+      if (!esDocumentoRelevante(textoFila)) continue;
+
+      const matchNumDoc = textoFila.match(/(IF|DOCFI|NO|DECRE|ACTO|PV)-\d{4}-\d+-[A-Z0-9_#-]+/i);
+      const nombreBase = matchNumDoc ? matchNumDoc[0].replace(/[/\\?%*:|"<>]/g, '_') : `doc_p${numeroPaginaDoc}_${i + 1}`;
+
+      const btnHojaVisualizar = fila.locator('button:has(i.z-icon-file-text-o), button:has(i.z-icon-file-text), button[title*="Visualizar" i], a[title*="Visualizar" i]').first();
+
+      if (await btnHojaVisualizar.isVisible().catch(() => false)) {
+        emitirLog(`  ▶ Abriendo visor (icono hoja): ${nombreBase}...`);
+
+        let resolverPdf;
+        const promesaPdf = new Promise((resolve) => {
+          const timeoutId = setTimeout(() => resolve(null), 25000);
+          const onResponse = async (res) => {
+            try {
+              if (res.status() !== 200) return;
+
+              const url = res.url();
+              const headers = res.headers();
+              const contentType = headers['content-type'] || '';
+              const disposition = headers['content-disposition'] || '';
+
+              const esPdf = (
+                contentType.includes('application/pdf') ||
+                url.includes('previsualizacion.pdf') ||
+                /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i.test(url)
+              );
+
+              if (esPdf) {
+                const body = await res.body().catch(() => null);
+                if (body && body.length > 2000 && body.toString('utf8', 0, 4) === '%PDF') {
+                  clearTimeout(timeoutId);
+                  page.off('response', onResponse);
+                  resolve(body);
+                }
+              }
+            } catch (_) {}
+          };
+          page.on('response', onResponse);
+        });
+
+        await btnHojaVisualizar.click({ force: true });
+
+        await procesarModalAbierto(
+          page,
+          expedienteRow,
+          carpetaDestino,
+          nombreBase,
+          hashesGuardados,
+          docsRegistrados,
+          emitirLog,
+          notificarCambio,
+          promesaPdf
+        );
+
+        if (!page.isClosed()) {
+            emitirLog('  🔄 Reconstruyendo vista del expediente para continuar...');
+
+            const inputReBuscador = page.locator('input[placeholder*="número GDE" i], input[title*="número GDE" i], input.z-textbox').first();
+            await inputReBuscador.waitFor({ state: 'visible', timeout: 10000 });
+            await inputReBuscador.fill('');
+            await inputReBuscador.fill(codigoSADEOficial);
+            const btnReLupa = page.locator('button:has(i.z-icon-search), a:has(i.z-icon-search)').first();
+            if (await btnReLupa.isVisible().catch(() => false)) await btnReLupa.click({ force: true });
+            else await page.keyboard.press('Enter');
+            await page.waitForTimeout(4000);
+
+            const reFilaExp = page.locator('tr.z-listitem, tr.z-row').filter({ hasText: numeroConCeros }).first();
+            await reFilaExp.waitFor({ state: 'visible', timeout: 10000 });
+            const reCombobox = reFilaExp.locator('.z-combobox').first();
+            await reCombobox.scrollIntoViewIfNeeded();
+            const reBtnFlecha = reCombobox.locator('.z-combobox-button, .z-combobox-btn, i.z-icon-caret-down').first();
+            if (await reBtnFlecha.isVisible().catch(() => false)) await reBtnFlecha.click();
+            else { const inputReCombo = reCombobox.locator('input').first(); await inputReCombo.click(); await page.keyboard.press('Alt+ArrowDown'); }
+            const reItemVisualizar = page.locator('div.z-combobox-popup li.z-comboitem span.z-comboitem-text:text-is("Visualizar"), .z-comboitem-text:text-is("Visualizar")').first();
+            await reItemVisualizar.waitFor({ state: 'visible', timeout: 6000 });
+            await reItemVisualizar.click({ force: true });
+            await page.waitForTimeout(4500);
+
+            const reTabSinPase = page.locator('.z-tab:has-text("Sin Pase")').first();
+            if (await reTabSinPase.isVisible({ timeout: 8000 }).catch(() => false)) {
+                await reTabSinPase.click({ force: true });
+                await page.waitForTimeout(2000);
+            }
+
+            for(let p = 1; p < numeroPaginaDoc; p++) {
+                const rePanelActivo = page.locator('.z-tabpanel:not([style*="display: none"])');
+                const btnReSiguiente = rePanelActivo.locator('.z-paging-next:not([disabled])').first();
+                if (await btnReSiguiente.isVisible().catch(() => false)) {
+                    await btnReSiguiente.click({ force: true });
+                    await page.waitForTimeout(2000);
+                }
+            }
+        }
+      }
+
+      await page.waitForTimeout(600).catch(() => {});
+    }
+
+    const evaluacionActual = evaluarChecklist(docsRegistrados, fechaCarpeta);
+    if (evaluacionActual.completo) {
+      hayPaginaDocSiguiente = false;
+      break;
+    }
+
+    const btnSiguiente = panelActivo.locator('.z-paging-next:not([disabled])').first();
+    if (await btnSiguiente.isVisible().catch(() => false)) {
+      await btnSiguiente.click({ force: true });
+      numeroPaginaDoc++;
+      emitirLog(`  ⏳ Pasando a página ${numeroPaginaDoc} de "Sin Pase"...`);
+      await page.waitForTimeout(2000);
+    } else {
+      hayPaginaDocSiguiente = false;
     }
   }
 
-  const btnCerrarTramitacion = page.locator('.z-window-modal-close, .z-window-close').last();
-  if (await btnCerrarTramitacion.isVisible()) {
-    await btnCerrarTramitacion.click();
-    await page.waitForTimeout(1000);
+  const evaluacion = evaluarChecklist(docsRegistrados, fechaCarpeta);
+  if (evaluacion.completo) {
+    emitirLog(`[RPA GDE] ✔ Expediente completado con éxito (${docsRegistrados.length} PDFs válidos).`);
+    return true;
+  } else {
+    emitirLog(`[RPA GDE] ⚠️ Expediente incompleto. Faltan: ${evaluacion.faltantes.join(', ')}.`);
+    return false;
   }
-
-  emitirLog(`[RPA GDE] ✔ Descargas finalizadas para el expediente ${expediente}.`);
-  if (notificarCambioEstado) notificarCambioEstado();
 }
 
-async function ejecutarDescargaAutomatica(emitirLog = console.log, notificarCambioEstado = () => {}) {
-  if (procesoEnEjecucion) {
-    emitirLog('[RPA GDE] ⚠️ Ya hay una sesión de descarga activa.');
-    return;
-  }
-
-  procesoEnEjecucion = true;
+async function ejecutarDescargaAutomatica(emitirLog, notificarCambio) {
   abortarScraper = false;
+  let context = null;
+  let page = null;
 
   try {
-    const expedientes = obtenerTodosLosExpedientes();
-
-    const pendientes = [];
-    for (const exp of expedientes) {
-      if (exp.tiene_error_manual) continue;
-      const procesado = await yaFueProcesado(exp);
-      if (!procesado) pendientes.push(exp);
-    }
-
-    emitirLog(`[RPA GDE] Total a procesar: ${pendientes.length} expedientes.`);
+    const todos = dbService.obtenerTodosLosExpedientes();
+    const pendientes = todos.filter(e => !e.tiene_error_manual && (!e.estado || e.estado.toLowerCase() === 'pendiente'));
 
     if (pendientes.length === 0) {
-      emitirLog('[RPA GDE] No hay expedientes pendientes de descarga.');
+      emitirLog('[RPA GDE] ℹ No hay expedientes pendientes para procesar.');
       return;
     }
 
-    emitirLog(`[RPA GDE] Lanzando navegador para procesar ${pendientes.length} expedientes...`);
-    const { context, page } = await inicializarNavegador(false);
-    contextoNavegadorActivo = context;
+    emitirLog(`[RPA GDE] Total a procesar: ${pendientes.length} expedientes.`);
+    emitirLog('[RPA GDE] Lanzando navegador...');
 
-    await asegurarSesionActiva(page, emitirLog);
+    const nav = await inicializarNavegador(false);
+    context = nav.context;
+    page = nav.page;
+
+    await page.goto('https://eu-termasderiohondo.gde.gob.ar/eu-web/', { waitUntil: 'domcontentloaded' });
+    await page.waitForTimeout(2000);
+
+    if (page.url().includes('login') || page.url().includes('cas')) {
+      emitirLog('[RPA GDE] ⚠️ Sesión no iniciada. Por favor iniciá sesión en la ventana del navegador...');
+      await page.waitForURL('**/eu-web/**', { timeout: 120000 }).catch(() => null);
+      emitirLog('[RPA GDE] ✔ Inicio de sesión detectado.');
+      await page.waitForTimeout(2000);
+    }
 
     for (const exp of pendientes) {
-      if (abortarScraper) {
-        emitirLog('[RPA GDE] ⏹ Proceso abortado por el usuario.');
+      if (abortarScraper || page.isClosed()) {
+        emitirLog('[RPA GDE] ⛔ Proceso detenido por el usuario.');
         break;
       }
-      await procesarExpedienteScraper(page, exp, emitirLog, notificarCambioEstado);
+
+      const expFila = {
+        id: exp.id,
+        beneficiario: exp.beneficiario || exp.nombre || '',
+        expediente: exp.expediente,
+        fecha_orden: exp.fecha || exp.fecha_orden,
+        monto: exp.monto
+      };
+
+      const exito = await procesarExpedienteScraper(page, expFila, RUTA_ENTRADA_BASE, emitirLog, notificarCambio);
+
+      if (!exito) {
+        dbService.guardarObservacion(exp.expediente, 'Faltan documentos obligatorios en checklist o revisión manual', 1);
+      }
+
+      if (typeof notificarCambio === 'function') notificarCambio();
+      await page.waitForTimeout(1500);
     }
 
-    if (!abortarScraper) {
-      emitirLog('\n[RPA GDE] 🎉 Proceso completado exitosamente.');
-    }
-  } catch (err) {
-    if (abortarScraper) {
-      emitirLog('[RPA GDE] ⏹ Sesión cerrada por solicitud de detención.');
-    } else {
-      emitirLog(`[RPA GDE] ❌ Error en el scraper: ${err.message}`);
-    }
+    emitirLog('[RPA GDE] 🎉 Proceso completado exitosamente.');
+  } catch (error) {
+    emitirLog(`[RPA GDE] ❌ Error general en la ejecución: ${error.message}`);
   } finally {
-    procesoEnEjecucion = false;
-    abortarScraper = false;
-    if (contextoNavegadorActivo) {
-      await contextoNavegadorActivo.close().catch(() => {});
-      contextoNavegadorActivo = null;
+    if (context) {
+      await context.close().catch(() => {});
     }
-    if (notificarCambioEstado) notificarCambioEstado({ tipo: 'bot_terminado' });
   }
 }
 
 module.exports = {
+  inicializarNavegador,
+  procesarExpedienteScraper,
   ejecutarDescargaAutomatica,
   detenerScraper
 };
